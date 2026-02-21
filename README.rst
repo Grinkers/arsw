@@ -4,8 +4,15 @@
   :alt: APSW logo - links to documentation
   :target: https://rogerbinns.github.io/apsw/
 
-APSW stands for **A**\ nother **P**\ ython **S**\ QLite **W**\ rapper.   APSW
-supports CPython 3.10 onwards.
+ARSW stands for **A**\ nother **R**\ ust **S**\ QLite **W**\ rapper.
+
+**DO NOT USE THIS**
+
+This is a public playground to play with AI agents. The goal is to learn where
+ AI agents are good, bad, useful, or harmful. Really stupid things will be done
+ here, including Issues, PRs, and the source itself. Unless otherwise noted,
+ expect everything to be deleted with no notice. Anything useful will happen
+ upstream with artisan human hands.
 
 About
 =====
