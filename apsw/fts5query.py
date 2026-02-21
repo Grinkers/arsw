@@ -103,8 +103,6 @@ Other helpful functionality includes:
 
 from __future__ import annotations
 
-import sys
-
 import dataclasses
 
 from typing import Any, NoReturn, Literal, TypeAlias
@@ -351,7 +349,7 @@ def from_dict(d: dict[str, Any] | Sequence[str] | str | QueryTokens) -> QUERY:
 
     klass = _dict_name_class.get(d["@"])
     if klass is None:
-        raise ValueError(f"\"{d['@']}\" is not a known query type")
+        raise ValueError(f'"{d["@"]}" is not a known query type')
 
     if klass is PHRASE:
         res = PHRASE(
@@ -577,6 +575,7 @@ _walk_attrs = {
     NOT: ("match", "no_match"),
     COLUMNFILTER: ("query",),
 }
+
 
 def _is_QUERY(obj):
     return isinstance(obj, QUERY)
@@ -833,7 +832,7 @@ class _Parser:
                 if self.lookahead.tok == _Parser.TokenType.EOF:
                     self.error("unclosed (", token)
                 else:
-                    self.error(f"Expected ) to close ( at position { token.pos}", self.lookahead)
+                    self.error(f"Expected ) to close ( at position {token.pos}", self.lookahead)
             self.take_token()
             return query
 

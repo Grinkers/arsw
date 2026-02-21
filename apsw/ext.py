@@ -22,7 +22,7 @@ import traceback
 import types
 from dataclasses import dataclass, is_dataclass, make_dataclass
 from fractions import Fraction
-from typing import Any, Literal, Protocol, TextIO, overload, TYPE_CHECKING
+from typing import Any, Literal, Protocol, TextIO
 from collections.abc import Callable, Iterator, AsyncIterator, AsyncIterable, Iterable, Sequence, Awaitable
 from types import NoneType
 
@@ -216,6 +216,7 @@ class TypesConverterCursorFactory:
         def _rowtracer(self, cursor: apsw.Cursor, values: apsw.SQLiteValues) -> tuple[Any, ...]:
             return tuple(self.factory.convert_value(d[1], v) for d, v in zip(cursor.get_description(), values))
 
+
 class Function:
     """Provides a direct Python way to call a SQL level function
 
@@ -231,6 +232,7 @@ class Function:
     generate the documentation to accurately reflect that without one
     of them having problems.
     """
+
     # This is tested in tests/jsonb.py because it was developed in
     # conjunction with jsonb
     def __init__(
@@ -1201,7 +1203,6 @@ class ShowResourceUsage:
             vals.append((self._descriptions["monotonic"], times[1] - self._times[1]))
 
         if self.scope:
-
             for k in dir(usage):
                 if not k.startswith("ru_"):
                     continue
@@ -2264,6 +2265,7 @@ def get_column_names(row: Any) -> tuple[Sequence[str], VTColumnAccess]:
         return tuple(f"column{x}" for x in range(len(row))), VTColumnAccess.By_Index
     raise TypeError(f"Can't figure out columns for {row}")
 
+
 class VirtualModuleCallable(Protocol):
     """
     What :func:`make_virtual_module` takes as the callable
@@ -2280,6 +2282,7 @@ class VirtualModuleCallable(Protocol):
     def __call__(self, *args, **kwargs) -> Iterable | AsyncIterable:
         "It can either an iterator over the values"
         ...
+
 
 # ::TODO:: sphinx barfs when these overloads are present even though TYPE_CHECKING
 # is False.  Will need to automate commenting out the block while sphinx runs
@@ -2619,11 +2622,13 @@ def make_virtual_module(
         read_only=True,
     )
 
+
 def _get_anext(aiterator: AsyncIterator[apsw.SQLiteValues]) -> apsw.SQLiteValues:
     async def async_get_anext():
         return await anext(aiterator)
 
     return apsw.async_run_coro(async_get_anext())
+
 
 def generate_series_sqlite(
     start: apsw.SQLiteValue = None, stop: apsw.SQLiteValue = 0xFFFF_FFFF_FFFF_FFFF, step: apsw.SQLiteValue = 1
