@@ -22,12 +22,14 @@ It focuses on build/test/lint commands and practical style rules.
 - You may run tests from `apsw/tests/`; this rule is about file changes only.
 
 ## Environment Setup
-- Create virtualenv: `python3 -m venv .venv`
-- Install dev deps: `make dev-depends PYTHON=.venv/bin/python`
-- Optional docs deps: `make doc-depends PYTHON=.venv/bin/python`
+- Preferred environment manager: `uv`
+- Sync venv from lock file: `uv sync --dev`
+- Run tools via uv: `uv run <command>`
+- Optional docs deps (legacy make target): `make doc-depends PYTHON=.venv/bin/python`
 Notes:
 - Build extension in-place before running tests.
-- Most commands assume `python3` unless `PYTHON=...` is set.
+- Use `.venv/bin/python` for Makefile targets that take `PYTHON=...`.
+- Keep `uv.lock` committed; dependency/version changes must update it.
 
 ## Build Commands
 Canonical local build:
@@ -35,12 +37,12 @@ Canonical local build:
   - Fetches SQLite, builds APSW in-place, builds `testextension.sqlext`.
 
 Direct setup.py flow:
-- `python3 setup.py fetch --version=<sqlite-version> --all build_ext --inplace --force --enable-all-extensions`
-- `python3 setup.py build_test_extension`
+- `uv run python setup.py fetch --version=<sqlite-version> --all build_ext --inplace --force --enable-all-extensions`
+- `uv run python setup.py build_test_extension`
 
 Debug and packaging:
 - `make build_ext_debug`
-- `python3 setup.py sdist --for-pypi`
+- `uv run python setup.py sdist --for-pypi`
 - `make source`
 
 ## Test Commands
@@ -49,27 +51,33 @@ Full default workflow:
   - Runs `python -m apsw.tests`, old-symbol compatibility tests, and retest pass.
 
 Run all tests directly:
-- `python3 -m apsw.tests`
-- `python3 -m apsw.tests -v`
+- `uv run python -m apsw.tests`
+- `uv run python -m apsw.tests -v`
 
 Run a single test (preferred forms):
 - Single method in main suite:
-  - `python3 -m apsw.tests APSW.testStatements -v`
+  - `uv run python -m apsw.tests APSW.testStatements -v`
 - Single class from imported sub-suites:
-  - `python3 -m apsw.tests FTS -v`
+  - `uv run python -m apsw.tests FTS -v`
 - Single method from imported sub-suites:
-  - `python3 -m apsw.tests FTS.testLocale -v`
+  - `uv run python -m apsw.tests FTS.testLocale -v`
 
 Why prefer `python -m apsw.tests ...` for single tests:
 - `apsw/tests/__main__.py` calls `setup()` before `unittest.main()`.
 - `setup()` enables/disables environment-sensitive tests correctly.
 
 Useful filtering and variants:
-- Pattern filter: `python3 -m apsw.tests -k locale -v`
+- Pattern filter: `uv run python -m apsw.tests -k locale -v`
 - Debug test run: `make test_debug`
 - Full run + debug: `make fulltest`
 - Type/runtime stub checks: `make stubtest`
-- Old symbol compatibility tests: `env PYTHONPATH=. python3 tools/names.py run-tests`
+- Old symbol compatibility tests: `env PYTHONPATH=. uv run python tools/names.py run-tests`
+
+CPython 3.10 support check (recommended smoke path):
+- `UV_PROJECT_ENVIRONMENT=.venv uv run python --version` (expect `3.10.x`)
+- `UV_PROJECT_ENVIRONMENT=.venv uv run python setup.py fetch --version=<sqlite-version> --all build_ext --inplace --force --enable-all-extensions`
+- `UV_PROJECT_ENVIRONMENT=.venv uv run python setup.py build_test_extension`
+- `UV_PROJECT_ENVIRONMENT=.venv uv run python -m apsw.tests`
 
 Test environment flags used by suite:
 - `APSW_TEST_LARGE=t` enables large-object coverage.
@@ -82,7 +90,7 @@ Configured in `pyproject.toml`:
 - Flake8 max line length: 120
 
 Practical commands:
-- `python3 -m ruff check .`
+- `uv run ruff check .`
 - `make stubtest`
 
 C formatting:
