@@ -15,7 +15,6 @@ import dataclasses
 import inspect
 import io
 import json
-import math
 import os
 import re
 import shlex
@@ -24,7 +23,7 @@ import tempfile
 import textwrap
 import time
 import traceback
-from typing import TextIO
+from typing import Callable, TextIO
 import webbrowser
 
 import apsw
@@ -1060,7 +1059,7 @@ Enter ".help" for instructions
             while command[pos].strip():  # test it isn't whitespace, eq quoting
                 pos += 1
             cmd = [cmd[0], cmd[1], command[pos:].strip()]
-        res = fn(cmd[1:])
+        fn(cmd[1:])
 
     ###
     ### Commands start here
@@ -1163,9 +1162,9 @@ Enter ".help" for instructions
                 sel = "*" if self.db is c else " "
                 flags = []
                 # lower values are more meaningful
-                for value, name in sorted((k, v) for k,v in apsw.mapping_open_flags.items() if isinstance(k, int)):
+                for value, name in sorted((k, v) for k, v in apsw.mapping_open_flags.items() if isinstance(k, int)):
                     if c.open_flags & value:
-                        flags.append(name[len("SQLITE_OPEN_"):])
+                        flags.append(name[len("SQLITE_OPEN_") :])
                 self.write(
                     self.stdout,
                     f'{co.bold}{sel}{co.bold_} {co.vnumber}{i: 2}{co.vnumber_} - ({c.open_vfs}) "{co.vstring}{c.filename}{co.vstring_}"    ({"|".join(flags)})\n',
@@ -2371,7 +2370,7 @@ Enter ".help" for instructions
                     flags = 0
                     for flag in flag_names.split("|"):
                         flag = flag.strip().upper()
-                        name = f"SQLITE_OPEN_{ flag }" if not flag.startswith("SQLITE_OPEN") else flag
+                        name = f"SQLITE_OPEN_{flag}" if not flag.startswith("SQLITE_OPEN") else flag
                         if name not in apsw.mapping_open_flags:
                             raise self.Error(f"'{name}' is not a known open flag")
                         flags |= apsw.mapping_open_flags[name]
@@ -2399,12 +2398,9 @@ Enter ".help" for instructions
                 except OSError:
                     pass
         self.dbfilename = dbname if dbname is not None else ""
-        self._db = apsw.Connection(
-            self.dbfilename, vfs=vfs, flags=flags
-        )
+        self._db = apsw.Connection(self.dbfilename, vfs=vfs, flags=flags)
         self._apply_fts()
         self.db_references.add(self.db)
-
 
     def command_output(self, cmd):
         """output FILENAME: Send output to FILENAME (or stdout)
@@ -2922,7 +2918,6 @@ Enter ".help" for instructions
         for k, v in vfs.items():
             self.write(self.stdout, " " * (w - len(k)))
             self.write(self.stdout, k + ":  ")
-            vout = "0x%x" % v if k.startswith("x") else str(v)
             self.write_value(v)
             self.write(self.stdout, "\n")
 
@@ -3542,7 +3537,6 @@ Enter ".help" for instructions
             return ""
 
         def colour_value(self, val, formatted):
-            c = self.colour
             if val is None:
                 return self.vnull + formatted + self.vnull_
             if isinstance(val, str):
@@ -3621,12 +3615,6 @@ Enter ".help" for instructions
     # unpollute namespace
     del d
     del _colourscheme
-    try:
-        del n
-        del x
-        del v
-    except Exception:
-        pass
 
 
 def trydelete(filename: str):

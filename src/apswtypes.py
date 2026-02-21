@@ -1,7 +1,8 @@
 import contextvars
 
-from typing import Callable, Any, Iterable, Sequence, Literal, Protocol, TypeAlias, final, Self, Coroutine, overload
-from collections.abc import Mapping, Buffer, Iterator, Awaitable
+from typing import Callable, Any, Iterable, Sequence, Protocol, TypeAlias, final, Coroutine
+from typing_extensions import Buffer, Self
+from collections.abc import Mapping, Iterator, Awaitable
 
 import array
 import types
@@ -13,15 +14,20 @@ float, bytes (Buffer), and str (unicode text)"""
 SQLiteValues = tuple[SQLiteValue, ...]
 "A sequence of zero or more SQLiteValue"
 
+
 class PyObjectBinding:
     "Result of :meth:`pyobject`"
+
     ...
+
 
 class CArrayBinding:
     "Result of :meth:`carray`"
+
     ...
 
-Binding = SQLiteValue | zeroblob | PyObjectBinding | CArrayBinding
+
+Binding: TypeAlias = "SQLiteValue | zeroblob | PyObjectBinding | CArrayBinding"
 """An individual binding can be any of the SQLiteValues.
 zeroblob, :meth:`pyobject`, or :meth:`carray`"""
 
@@ -134,7 +140,7 @@ to let it continue"""
 PreupdateHook = Callable[[PreUpdate], None]
 """The hook is called with information about the update, and has no return value"""
 
-TokenizerResult = Iterable[str | tuple[str, ...] | tuple[int, int, *tuple[str, ...]]]
+TokenizerResult = Iterable[str | tuple[str, ...] | tuple[int | str, ...]]
 """The return from a tokenizer is based on the include_offsets and
 include_colocated parameters you provided, both defaulting to
 ``True``.  See :meth:`FTS5Tokenizer.__call__` for examples.
@@ -180,6 +186,7 @@ JSONBTypes = (
 in JSONB.  Like the builtin JSON module, None/int/float/bool keys will be
 stringized."""
 
+
 class AsyncConnectionController(Protocol):
     """Manages a worker thread and marshalling async requests to it
 
@@ -218,13 +225,18 @@ class AsyncConnectionController(Protocol):
         """
         ...
 
+
 # Async Note: These types do not exist separately at runtime.  They
 # are present in type stubs to allow IDE and type checking.
 
+
 class AsyncConnection:
     "A type stub to indicate a Connection in async mode"
+
     ...
+
 
 class AsyncSession:
     "A type stub to indicate a :class:`Session` in async mode"
+
     ...

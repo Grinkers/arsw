@@ -12,6 +12,10 @@ apsw = "apsw.__main__:main"
 
 [tool.ruff]
 line-length = 120
+extend-exclude = ["apsw/tests", "doc", "examples", "tools", "setup.py", "src/apswtypes.py"]
+
+[tool.ruff.lint]
+ignore = ["E401", "E402", "E722", "E731", "E741"]
 
 [tool.flake8]
 max-line-length = 120

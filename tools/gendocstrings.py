@@ -32,8 +32,26 @@ import re
 
 import names
 
-from apsw.tests.async_meta import get_meta as async_category
-from apsw.tests.async_meta import ASYNCABLE
+try:
+    from apsw.tests.async_meta import ASYNCABLE, get_meta as async_category
+except TypeError as exc:
+    if "unsupported operand type(s) for |" not in str(exc):
+        raise
+    import __future__
+
+    _async_meta_path = pathlib.Path(__file__).resolve().parents[1] / "apsw" / "tests" / "async_meta.py"
+    _scope: dict[str, Any] = {}
+    exec(
+        compile(
+            _async_meta_path.read_text(encoding="utf8"),
+            str(_async_meta_path),
+            "exec",
+            flags=__future__.annotations.compiler_flag,
+        ),
+        _scope,
+    )
+    async_category = _scope["get_meta"]
+    ASYNCABLE = _scope["ASYNCABLE"]
 
 # symbols to skip because we can't apply docstrings (PyModule_AddObject doesn't take docstring)
 docstrings_skip = {
@@ -81,7 +99,7 @@ def get_sqlite_constant_info(name: str) -> dict:
     for title, details in consts.items():
         if name in details["vars"]:
             return {"title": title, "url": details["page"], "value": getattr(apsw, name)}
-    raise ValueError(f"constant { name } not found")
+    raise ValueError(f"constant {name} not found")
 
 
 def get_mapping_info(name: str) -> dict:
@@ -94,7 +112,7 @@ def get_mapping_info(name: str) -> dict:
             found_in.append((len(i), title, details))
     found_in.sort()
     if not found_in:
-        raise ValueError(f"Couldn't figure out { name }")
+        raise ValueError(f"Couldn't figure out {name}")
     f = found_in[-1]
     return {"title": f[1], "url": f[2]["page"], "members": f[2]["vars"]}
 
@@ -108,7 +126,7 @@ def get_old_name(item) -> str | None:
 
 
 def get_usage(item) -> str:
-    return f"{ item['name'] }{ item['signature_original'] }".replace('"', '\\"')
+    return f"{item['name']}{item['signature_original']}".replace('"', '\\"')
 
 
 all_exc_doc = {}
@@ -125,7 +143,7 @@ def get_all_exc_doc() -> None:
             capture.pop(0)
         while not capture[-1].strip():
             capture.pop()
-        doc = [f"{ line }\n" for line in textwrap.dedent("\n".join(capture)).split("\n")]
+        doc = [f"{line}\n" for line in textwrap.dedent("\n".join(capture)).split("\n")]
         all_exc_doc[cur_name] = doc
         capture = None
 
@@ -157,9 +175,9 @@ def process_docdb(data: dict[str, Any]) -> list:
                 pass
             else:
                 assert name in docstring[0]
-                docstring[0] = docstring[0].replace(name, f"{ klass }.{ name }", 1)
+                docstring[0] = docstring[0].replace(name, f"{klass}.{name}", 1)
 
-            c = classify([f"{ line }\n" for line in docstring])
+            c = classify([f"{line}\n" for line in docstring])
             if c:
                 res.append(c)
     return res
@@ -173,7 +191,7 @@ def classify(doc: list[str]) -> dict | None:
     assert kind.endswith("::")
     kind = kind.rstrip(":")
 
-    assert kind in ("method", "attribute", "class"), f"unknown kind { kind } in { line }"
+    assert kind in ("method", "attribute", "class"), f"unknown kind {kind} in {line}"
     rest = line.split("::", 1)[1].strip()
     if "(" in rest:
         name, signature = rest.split("(", 1)
@@ -191,7 +209,7 @@ def classify(doc: list[str]) -> dict | None:
     while doc and not doc[-1].strip():
         doc = doc[:-1]
 
-    doc = [f"{ line }\n" for line in textwrap.dedent("".join(doc) + "\n").strip().split("\n")]
+    doc = [f"{line}\n" for line in textwrap.dedent("".join(doc) + "\n").strip().split("\n")]
 
     n = 0
     while n < len(doc):
@@ -200,15 +218,15 @@ def classify(doc: list[str]) -> dict | None:
             indent = " " * doc[n].find("-*")
 
             if len(calls) > 1:
-                lines = [f"{ indent }Calls:\n"]
+                lines = [f"{indent}Calls:\n"]
                 for call in calls:
-                    lines.append(f"{ indent }  * `{ call } <{ funclist[call] }>`__\n")
+                    lines.append(f"{indent}  * `{call} <{funclist[call]}>`__\n")
             else:
-                lines = [f"{ indent }Calls: `{ calls[0] } <{ funclist[calls[0]] }>`__\n"]
+                lines = [f"{indent}Calls: `{calls[0]} <{funclist[calls[0]]}>`__\n"]
             doc[n : n + len(lines)] = lines
         n += 1
 
-    symbol = make_symbol(f"{ name }.class" if kind == "class" else name)
+    symbol = make_symbol(f"{name}.class" if kind == "class" else name)
     return {
         "kind": kind,
         "name": name,
@@ -231,7 +249,7 @@ def cppsafe(lines: list[str], eol: str) -> str:
     def backslash(l: str) -> str:
         return l.replace('"', '\\"').replace("\n", "\\n")
 
-    res = "\n".join(f""""{ backslash(line) }"{ eol }""" for line in lines)
+    res = "\n".join(f""""{backslash(line)}"{eol}""" for line in lines)
     res = res.strip().strip("\\").strip()
     return res
 
@@ -242,7 +260,7 @@ def fixup(item: dict, eol: str) -> str:
     if item["signature"]:
         # cpython can't handle the arg or return type info
         func = item["name"].split(".")[1]
-        lines = [f"""{ item["name"] }{ item["signature_original"] }\n\n"""] + lines
+        lines = [f"""{item["name"]}{item["signature_original"]}\n\n"""] + lines
 
     return cppsafe(lines, eol)
 
@@ -324,7 +342,7 @@ def check_and_update(symbol: str, code: str) -> None:
             continue
         return check_and_update_file(fn, symbol, code)
     else:
-        raise ValueError(f"Failed to find code with { symbol }")
+        raise ValueError(f"Failed to find code with {symbol}")
 
 
 def check_and_update_file(filename: str, symbol: str, code: str) -> None:
@@ -339,7 +357,7 @@ def check_and_update_file(filename: str, symbol: str, code: str) -> None:
         elif symbol in line:
             insection = True
     else:
-        raise ValueError(f"{ symbol } not found in { filename }")
+        raise ValueError(f"{symbol} not found in {filename}")
 
     lines = lines[:lineopen] + code.split("\n") + lines[lineclose + 1 :]
 
@@ -351,7 +369,7 @@ def check_and_update_file(filename: str, symbol: str, code: str) -> None:
 
 def replace_if_different(filename: str, contents: str) -> None:
     if not os.path.exists(filename) or pathlib.Path(filename).read_text() != contents:
-        print(f"{ 'Creating' if not os.path.exists(filename) else 'Updating' } { filename }")
+        print(f"{'Creating' if not os.path.exists(filename) else 'Updating'} {filename}")
         pathlib.Path(filename).write_text(contents)
 
 
@@ -410,7 +428,7 @@ def callable_erasure(f, token="Callable"):
         c = rest[0]
         if c == "]":  # no type to erase
             continue
-        assert c == "[", f"expected [ at '{ rest }' processing '{ f }'"
+        assert c == "[", f"expected [ at '{rest}' processing '{f}'"
         nesting = 1
         rest = rest[1:]
         while nesting:
@@ -434,8 +452,8 @@ def do_argparse(item):
         except KeyError:
             pass
         if param["name"] != "*" and not param["type"]:
-            sys.exit(f"{ item['name'] } param { param } has no type from { item['signature_original'] }")
-    res = [f"#define { item['symbol'] }_CHECK do {{ \\"]
+            sys.exit(f"{item['name']} param {param} has no type from {item['signature_original']}")
+    res = [f"#define {item['symbol']}_CHECK do {{ \\"]
     # names of python level keywords
     kwlist = []
 
@@ -458,7 +476,7 @@ def do_argparse(item):
         default_check = None
         if seen_star and not param["default"]:
             sys.exit(
-                f'param { param } comes after * or args with defaults and must have default value in { item["name"] } { item["signature_original"] }'
+                f"param {param} comes after * or args with defaults and must have default value in {item['name']} {item['signature_original']}"
             )
 
         assert "Optional" not in param["type"] and "Union" not in param["type"], f"{param=} {item['name']=}"
@@ -466,15 +484,15 @@ def do_argparse(item):
         if param["type"].endswith(" | None"):
             # Optional is easier to handle in the following
             # code hence this transform
-            base = param["type"][:-len(" | None")]
-            param["type"]=f"Optional[{base}]"
+            base = param["type"][: -len(" | None")]
+            param["type"] = f"Optional[{base}]"
 
         if param["type"] == "str":
             type = "const char *"
             kind = "str"
             if param["default"]:
                 if param["default"] == "None":
-                    default_check = f"{ pname } == 0"
+                    default_check = f"{pname} == 0"
                 else:
                     breakpoint()
                     pass
@@ -483,7 +501,7 @@ def do_argparse(item):
             kind = "optional_str"
             if param["default"]:
                 if param["default"] == "None":
-                    default_check = f"{ pname } == 0"
+                    default_check = f"{pname} == 0"
                 else:
                     breakpoint()
                     pass
@@ -493,7 +511,7 @@ def do_argparse(item):
             if param["default"]:
                 assert param["default"] in {"True", "False"}
                 dval = int(param["default"] == "True")
-                default_check = f"{ pname } == { dval }"
+                default_check = f"{pname} == {dval}"
         elif param["type"] == "int":
             type = "int"
             kind = "int"
@@ -502,12 +520,12 @@ def do_argparse(item):
                     val = int(param["default"])
                 except ValueError:
                     val = param["default"].replace("apsw.", "")
-                default_check = f"{ pname } == ({ val })"
+                default_check = f"{pname} == ({val})"
         elif param["type"] == "int64":
             type = "long long"
             kind = "int64"
             if param["default"]:
-                default_check = f"{ pname } == { int(param['default']) }L"
+                default_check = f"{pname} == {int(param['default'])}L"
         elif param["type"] == "pointer":
             type = "void *"
             kind = "pointer"
@@ -530,14 +548,14 @@ def do_argparse(item):
             if param["default"]:
                 if param["default"] != "None":
                     breakpoint()
-                default_check = f"{ pname } == NULL"
+                default_check = f"{pname} == NULL"
         elif param["type"] == "Optional[list[str]]":
             type = "PyObject *"
             kind = "optional_list_str"
             if param["default"]:
                 if param["default"] != "None":
                     breakpoint()
-                default_check = f"{ pname } == NULL"
+                default_check = f"{pname} == NULL"
         elif callable_erasure(param["type"]) in {
             "Optional[Callable]",
             "Optional[RowTracer]",
@@ -555,7 +573,7 @@ def do_argparse(item):
             kind = "optional_Callable"
             if param["default"]:
                 if param["default"] == "None":
-                    default_check = f"{ pname } == NULL"
+                    default_check = f"{pname} == NULL"
                 else:
                     breakpoint()
         elif param["type"] == "Optional[str | URIFilename]":
@@ -569,12 +587,13 @@ def do_argparse(item):
             kind = "optional_Bindings"
             if param["default"]:
                 if param["default"] == "None":
-                    default_check = f"{ pname } == NULL"
+                    default_check = f"{pname} == NULL"
                 else:
                     breakpoint()
                 pass
         elif (
-            param["type"] in {"FTS5TokenizerFactory", "FTS5Function", "FTS5QueryPhrase", "SessionStreamInput", "SessionStreamOutput"}
+            param["type"]
+            in {"FTS5TokenizerFactory", "FTS5Function", "FTS5QueryPhrase", "SessionStreamInput", "SessionStreamOutput"}
             or callable_erasure(param["type"]) == "Callable"
         ):
             type = "PyObject *"
@@ -632,24 +651,24 @@ def do_argparse(item):
             type = "PyObject *"
             kind = "optional_set"
             assert param["default"] == "None"
-            default_check = f"{ pname } == NULL"
+            default_check = f"{pname} == NULL"
         elif param["type"] == "utf8_and_size_or_none":
             type = "const char *"
             kind = "optional_UTF8AndSize"
-            default_check = f"{ pname } == NULL && { pname }_size == 0"
+            default_check = f"{pname} == NULL && {pname}_size == 0"
         else:
-            assert False, f"Don't know how to handle type for { item ['name'] } param { param }"
+            assert False, f"Don't know how to handle type for {item['name']} param {param}"
 
         kwlist.append(pname)
-        res.append(f"  assert(__builtin_types_compatible_p(typeof({ pname }), { type })); \\")
+        res.append(f"  assert(__builtin_types_compatible_p(typeof({pname}), {type})); \\")
         if kind == "optional_UTF8AndSize":
-            res.append(f"  assert(__builtin_types_compatible_p(typeof({ pname }_size), Py_ssize_t )); \\")
+            res.append(f"  assert(__builtin_types_compatible_p(typeof({pname}_size), Py_ssize_t )); \\")
 
         if default_check:
-            res.append(f"  assert({ default_check }); \\")
+            res.append(f"  assert({default_check}); \\")
 
         mandatory = "ARG_MANDATORY " if not seen_star else "ARG_OPTIONAL "
-        code += f"    { mandatory }ARG_{ kind }({ pname });\n"
+        code += f"    {mandatory}ARG_{kind}({pname});\n"
 
     res.append("} while(0)\n")
     if max_pos is None:
@@ -658,31 +677,31 @@ def do_argparse(item):
     code = (
         f"""\
   {{
-    { item['symbol'] }_CHECK;
-    { "PREVENT_INIT_MULTIPLE_CALLS;" if is_init else "" }
-    { "ARG_CONVERT_VARARGS_TO_FASTCALL;" if is_init else "" }
-    ARG_PROLOG({ max_pos}, { item['symbol'] }_KWNAMES);
+    {item["symbol"]}_CHECK;
+    {"PREVENT_INIT_MULTIPLE_CALLS;" if is_init else ""}
+    {"ARG_CONVERT_VARARGS_TO_FASTCALL;" if is_init else ""}
+    ARG_PROLOG({max_pos}, {item["symbol"]}_KWNAMES);
 """
         + code
         + f"""
-    ARG_EPILOG({ "NULL" if not is_init else -1 }, { item['symbol'] }_USAGE,{ " Py_XDECREF(fast_kwnames)" if is_init else " " });
+    ARG_EPILOG({"NULL" if not is_init else -1}, {item["symbol"]}_USAGE,{" Py_XDECREF(fast_kwnames)" if is_init else " "});
   }}"""
     )
 
     code = "\n".join(line for line in code.split("\n") if line.strip())
 
-    res.insert(0, f"""#define { item['symbol'] }_USAGE "{ get_usage(item) }"\n""")
+    res.insert(0, f"""#define {item["symbol"]}_USAGE "{get_usage(item)}"\n""")
 
     # put back to actual param names from mangling done to prevent
     # using C reserved words as variable names
     def repl(n):
         return {"default_": "default"}.get(n, n)
 
-    n = ", ".join(f'"{ repl(a) }"' for a in kwlist) if kwlist else "NULL"
+    n = ", ".join(f'"{repl(a)}"' for a in kwlist) if kwlist else "NULL"
 
-    res.insert(0, f"""#define { item['symbol'] }_KWNAMES { n }""")
+    res.insert(0, f"""#define {item["symbol"]}_KWNAMES {n}""")
 
-    check_and_update(f"{ item['symbol'] }_CHECK", code)
+    check_and_update(f"{item['symbol']}_CHECK", code)
 
     return "\n".join(res) + "\n"
 
@@ -695,7 +714,7 @@ def get_class_doc(klass: str, items: list[dict]) -> str:
     for item in items:
         if item["name"] == klass:
             return item["doc"]
-    raise ValueError(f"{ klass } doc not found")
+    raise ValueError(f"{klass} doc not found")
 
 
 def fmt_docstring(doc: list[str], indent: str) -> str:
@@ -752,7 +771,7 @@ def generate_typestubs(items: list[dict]) -> None:
             print(f"Async{callable_async(line)}", file=async_out)
             print(f'"async equivalent of :data:`{name}`"\n', file=async_out)
 
-    async_type_aliases_re = r"\b(" + "|".join(async_type_aliases) +r")\b"
+    async_type_aliases_re = r"\b(" + "|".join(async_type_aliases) + r")\b"
 
     def async_fix_type_aliases(signature):
         return re.sub(async_type_aliases_re, lambda mo: f"( {mo.group()} | Async{mo.group()} )", signature)
@@ -781,24 +800,23 @@ def generate_typestubs(items: list[dict]) -> None:
                 if not line.strip():
                     continue
                 print(f"{indent}{line.strip()}", file=out)
-                indent="    "
+                indent = "    "
             print('    """\n    ...\n', file=out)
             continue
-
 
         klass, name = item["name"].split(".", 1)
         signature = item["signature_original"]
 
         if klass in {"apsw"}:
-            name = item["name"][len(klass)+1 :]
+            name = item["name"][len(klass) + 1 :]
             if item["kind"] == "method":
                 assert signature.startswith("(")
-                print(f"{ baseindent }def { name }{ signature }:", file=out)
-                print(fmt_docstring(item["doc"], indent=f"{ baseindent }    "), file=out)
-                print(f"{ baseindent }    ...", file=out)
+                print(f"{baseindent}def {name}{signature}:", file=out)
+                print(fmt_docstring(item["doc"], indent=f"{baseindent}    "), file=out)
+                print(f"{baseindent}    ...", file=out)
             else:
                 assert item["kind"] == "attribute"
-                print(f"{ baseindent }{ name }: { attribute_type(item) }", file=out)
+                print(f"{baseindent}{name}: {attribute_type(item)}", file=out)
                 print(fmt_docstring(attr_docstring(item["doc"]), indent=baseindent), file=out)
         else:
             if klass != lastclass:
@@ -815,48 +833,38 @@ def generate_typestubs(items: list[dict]) -> None:
                     if asyncable:
                         print("@final", file=async_out)
 
-                print(f"{ baseindent }class { klass }{ extra }:", file=out)
-                print(fmt_docstring(doc, indent=f"{ baseindent }    "), file=out)
+                print(f"{baseindent}class {klass}{extra}:", file=out)
+                print(fmt_docstring(doc, indent=f"{baseindent}    "), file=out)
                 print(file=out)
 
                 if asyncable:
-                    print(f"{ baseindent }class Async{ klass }{ extra }:", file=async_out)
+                    print(f"{baseindent}class Async{klass}{extra}:", file=async_out)
                     async_doc = [f"This represents a :class:`{klass}` when in async mode.\n\n"]
-                    print(fmt_docstring(async_doc + doc, indent=f"{ baseindent }    "), file=async_out)
+                    print(fmt_docstring(async_doc + doc, indent=f"{baseindent}    "), file=async_out)
                     print(file=async_out)
-
 
             if item["kind"] == "method":
                 for find, replace in (
                     ("apsw.", ""),  # some constants
                     ("list[int,int]", "list[int]"),  # can't see how to type a 2 item list
-                    ("Literal[no_change]", "no_change"), # aren't allowed singletons
+                    ("Literal[no_change]", "no_change"),  # aren't allowed singletons
                 ):
                     signature = signature.replace(find, replace)
 
-                if (klass, name) == ("Changeset", "apply"):
-                    # yes it is ugly, but easier than trying to make this happen programmatically.  The
-                    print(f"""
-{baseindent}    @overload
-{baseindent}    @staticmethod
-{baseindent}    def apply(changeset: ChangesetInput, db: Connection, *, filter: Callable[[str], bool] | None = None, filter_change: Callable[[TableChange], bool] | None = None, conflict: Callable[[int,TableChange], int] | None = None, flags: int = 0, rebase: bool = False) -> bytes | None: ...
-{baseindent}    @overload
-{baseindent}    @staticmethod
-{baseindent}    async def apply(changeset: ChangesetInput, db: AsyncConnection, *, filter: Callable[[str], bool] | None = None, filter_change: Callable[[TableChange], bool] | None = None, conflict: Callable[[int,TableChange], int] | None = None, flags: int = 0, rebase: bool = False) -> bytes | None: ...
-""", file=out)
+                signature = re.sub(r"=\s*SQLITE_[A-Z0-9_]*(?:\s*\|\s*SQLITE_[A-Z0-9_]*)*", "= ...", signature)
 
                 if not asyncable or async_category(klass, name, "function") in {"sync", "dual", "value"}:
                     if klass in {"Changeset"}:
-                        print(f"{ baseindent}    @staticmethod", file=out)
+                        print(f"{baseindent}    @staticmethod", file=out)
                     elif (klass, name) == ("Connection", "as_async"):
-                        print(f"{ baseindent}    @classmethod", file=out)
-                        signature="(cls, " + signature[1:]
+                        print(f"{baseindent}    @classmethod", file=out)
+                        signature = "(cls, " + signature[1:]
                     else:
                         if not signature.startswith("(self"):
                             signature = "(self" + (", " if signature[1] != ")" else "") + signature[1:]
-                    print(f"{ baseindent }    def { name }{ signature }:", file=out)
-                    print(fmt_docstring(item["doc"], indent=f"{ baseindent }        "), file=out)
-                    print(f"{ baseindent }        ...", file=out)
+                    print(f"{baseindent}    def {name}{signature}:", file=out)
+                    print(fmt_docstring(item["doc"], indent=f"{baseindent}        "), file=out)
+                    print(f"{baseindent}        ...", file=out)
 
                 if (
                     asyncable
@@ -865,18 +873,17 @@ def generate_typestubs(items: list[dict]) -> None:
                     and name != "__init__"
                 ):
                     if klass in {"Changeset"}:
-                        print(f"{ baseindent}    @staticmethod", file=async_out)
+                        print(f"{baseindent}    @staticmethod", file=async_out)
                     else:
                         if not signature.startswith("(self"):
                             signature = "(self" + (", " if signature[1] != ")" else "") + signature[1:]
-
 
                     if name != "__init__":
                         assert "->" in signature, f"{klass=} {name=} {signature=}"
 
                         returns = signature.split("->")[-1].strip()
 
-                        if  returns in ASYNCABLE:
+                        if returns in ASYNCABLE:
                             signature = signature.split("->")[0] + " -> " + f"Async{returns}"
                         else:
                             for a in ASYNCABLE:
@@ -884,15 +891,18 @@ def generate_typestubs(items: list[dict]) -> None:
 
                     decl = "async def" if name not in {"__aiter__"} and acat != "value" else "def"
 
-                    print(f"{ baseindent }    { decl} { name }{ async_fix_type_aliases(callable_async(signature)) }:", file=async_out)
-                    print(fmt_docstring(item["doc"], indent=f"{ baseindent }        "), file=async_out)
-                    print(f"{ baseindent }        ...", file=async_out)
+                    print(
+                        f"{baseindent}    {decl} {name}{async_fix_type_aliases(callable_async(signature))}:",
+                        file=async_out,
+                    )
+                    print(fmt_docstring(item["doc"], indent=f"{baseindent}        "), file=async_out)
+                    print(f"{baseindent}        ...", file=async_out)
 
             else:
                 assert item["kind"] == "attribute"
                 if not asyncable or async_category(klass, name, "attribute") in {"sync", "dual", "value"}:
-                    print(f"{ baseindent }    { name }: { attribute_type(item) }", file=out)
-                    print(fmt_docstring(attr_docstring(item["doc"]), indent=f"{ baseindent }    "), file=out)
+                    print(f"{baseindent}    {name}: {attribute_type(item)}", file=out)
+                    print(fmt_docstring(attr_docstring(item["doc"]), indent=f"{baseindent}    "), file=out)
 
                 if asyncable and (acat := async_category(klass, name, "attribute")) in {"async", "dual", "value"}:
                     if acat == "value":
@@ -902,7 +912,7 @@ def generate_typestubs(items: list[dict]) -> None:
                             f"{baseindent}    {name}: Awaitable[{async_fix_type_aliases(attribute_type(item))}]",
                             file=async_out,
                         )
-                    print(fmt_docstring(attr_docstring(item["doc"]), indent=f"{ baseindent }    "), file=async_out)
+                    print(fmt_docstring(attr_docstring(item["doc"]), indent=f"{baseindent}    "), file=async_out)
 
         print("", file=out)
         if asyncable:
@@ -912,7 +922,7 @@ def generate_typestubs(items: list[dict]) -> None:
             old_name = names.renames[klass][name]
         except KeyError:
             continue
-        print(f"{ baseindent }{ '    ' if klass != 'apsw' else '' }{ old_name } = { name } ## OLD-NAME\n", file=out)
+        print(f"{baseindent}{'    ' if klass != 'apsw' else ''}{old_name} = {name} ## OLD-NAME\n", file=out)
 
     # constants
     print("\n", file=out)
@@ -922,8 +932,8 @@ def generate_typestubs(items: list[dict]) -> None:
         if n.startswith("SQLITE_") or n.startswith("FTS5_TOKENIZE_"):
             assert isinstance(getattr(apsw, n), int)
             ci = get_sqlite_constant_info(n)
-            print(f"""{ n }: int = { ci["value"] }""", file=out)
-            print(f'''"""For `{ ci["title"] } <{ ci["url"] }>'__"""''', file=out)
+            print(f"""{n}: int = {ci["value"]}""", file=out)
+            print(f'''"""For `{ci["title"]} <{ci["url"]}>'__"""''', file=out)
 
     # mappings
     def wrapvals(vals):
@@ -934,12 +944,12 @@ def generate_typestubs(items: list[dict]) -> None:
         if not n.startswith("mapping_"):
             continue
         mi = get_mapping_info(n)
-        print(f"{ n }: dict[str | int, int | str]", file=out)
+        print(f"{n}: dict[str | int, int | str]", file=out)
         print(
-            f'''"""{ mi["title"] } mapping names to int and int to names.
-Doc at { mi["url"] }
+            f'''"""{mi["title"]} mapping names to int and int to names.
+Doc at {mi["url"]}
 
-{ wrapvals(mi["members"]) }"""''',
+{wrapvals(mi["members"])}"""''',
             file=out,
         )
         print("", file=out)
@@ -952,7 +962,7 @@ Doc at { mi["url"] }
     for n in dir(apsw):
         if n != "ExecTraceAbort" and (not n.endswith("Error") or n == "Error"):
             continue
-        print(f"class { n }(Error):", file=out)
+        print(f"class {n}(Error):", file=out)
         print(fmt_docstring(get_exc_doc(n), indent="    "), file=out)
         print("", file=out)
 
@@ -964,8 +974,9 @@ Doc at { mi["url"] }
 def attribute_type(item: dict) -> str:
     # docstring will start with :type: type
     doc = "\n".join(item["doc"]).strip().split("\n")[0]
-    assert doc.startswith(":type:"), f"Expected :type: for doc in { item }"
+    assert doc.startswith(":type:"), f"Expected :type: for doc in {item}"
     return doc[len(":type:") :].strip().replace("Literal[no_change]", "no_change")
+
 
 # This code was generated by gemini, and then modified by me to fix
 # various problems and remove unused code.  the prompt was to add |
@@ -980,9 +991,12 @@ def callable_async(sig: str) -> str:
 
         i, depth, last_comma = content_idx, 1, -1
         while i < len(sig) and depth > 0:
-            if sig[i] == "[": depth += 1
-            elif sig[i] == "]": depth -= 1
-            elif sig[i] == "," and depth == 1: last_comma = i
+            if sig[i] == "[":
+                depth += 1
+            elif sig[i] == "]":
+                depth -= 1
+            elif sig[i] == "," and depth == 1:
+                last_comma = i
             i += 1
 
         args = callable_async(sig[content_idx : last_comma + 1])
@@ -992,6 +1006,7 @@ def callable_async(sig: str) -> str:
         pos = i - 1
 
     return res + sig[pos:]
+
 
 if __name__ == "__main__":
     import json
@@ -1021,9 +1036,9 @@ if __name__ == "__main__":
     for item in sorted(items, key=lambda x: x["symbol"]):
         if item["skip_docstring"]:
             continue
-        print(f"""{ method } { item["symbol"] }_DOC{ mid }{ fixup( item, eol) } { end }\n""", file=out)
+        print(f"""{method} {item["symbol"]}_DOC{mid}{fixup(item, eol)} {end}\n""", file=out)
 
-        if f"{ item['symbol'] }_CHECK" in allcode:
+        if f"{item['symbol']}_CHECK" in allcode:
             print(do_argparse(item), file=out)
         else:
             if any(param["name"] != "return" for param in item["signature"]) and not any(
@@ -1048,16 +1063,16 @@ if __name__ == "__main__":
         if item["kind"] != "class":
             old_name = get_old_name(item)
             if old_name:
-                print(f'''#define { item['symbol'] }_OLDNAME "{ old_name }"''', file=out)
-                if f"{ item['symbol'] }_CHECK" not in allcode:
-                    print(f'''#define { item['symbol'] }_USAGE "{ get_usage(item) }"''', file=out)
+                print(f'''#define {item["symbol"]}_OLDNAME "{old_name}"''', file=out)
+                if f"{item['symbol']}_CHECK" not in allcode:
+                    print(f'''#define {item["symbol"]}_USAGE "{get_usage(item)}"''', file=out)
                 print(
-                    f"""#define { item['symbol'] }_OLDDOC { item['symbol'] }_USAGE "\\n(Old less clear name { old_name })"\n""",
+                    f"""#define {item["symbol"]}_OLDDOC {item["symbol"]}_USAGE "\\n(Old less clear name {old_name})"\n""",
                     file=out,
                 )
 
     for name, doc in sorted(all_exc_doc.items()):
-        print(f"""{ method } { name }_exc_DOC{ mid }{ cppsafe(doc, eol) } { end }\n""", file=out)
+        print(f"""{method} {name}_exc_DOC{mid}{cppsafe(doc, eol)} {end}\n""", file=out)
 
     outval = out.getvalue()
     replace_if_different(sys.argv[2], outval)
