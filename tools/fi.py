@@ -34,7 +34,9 @@ def file_cleanup():
     for f in glob.glob(f"{tmpdir.name}/*"):
         os.remove(f)
 
+
 examples_completed = set()
+
 
 def ignore_print(*args, **kwargs):
     pass
@@ -271,7 +273,9 @@ def exercise(example_code, expect_exception):
     apsw.jsonb_decode(encoded, parse_int=int, parse_float=float, object_hook=dict, array_hook=tuple)
     apsw.jsonb_detect(encoded)
 
-    encoded = con.execute("select jsonb(?)", ("""[0x1234, 4., .3, "\\0 𐌼𐌰𐌲 𐌲𐌻𐌴𐍃 𐌹̈𐍄𐌰𐌽", "\\'", "\\"", "\\u1234"]""",)).get
+    encoded = con.execute(
+        "select jsonb(?)", ("""[0x1234, 4., .3, "\\0 𐌼𐌰𐌲 𐌲𐌻𐌴𐍃 𐌹̈𐍄𐌰𐌽", "\\'", "\\"", "\\u1234"]""",)
+    ).get
     apsw.jsonb_decode(encoded)
 
     if expect_exception:
@@ -726,7 +730,6 @@ def exercise(example_code, expect_exception):
     del vfsinstance
     del vfsinstance2
 
-
     if False:
         # This does recursion error, which also causes lots of last chance
         # exception printing to stderr, making the noise unhelpful.  The
@@ -745,7 +748,7 @@ def exercise(example_code, expect_exception):
 
     # unload all the modules - the sort ensures the base module is last
     for name in reversed(list(sys.modules.keys())):
-        if name == "apsw" or name.startswith("apsw.") and name in sys.modules:
+        if name.startswith("apsw.") and name in sys.modules:
             del sys.modules[name]
             gc.collect()
 
@@ -956,7 +959,7 @@ class Tester:
         # a module because it has missing __path__ and similar
         if key[2] == "apsw_leak_check" or key[2] == "apsw_module_getattr" or key[2] == "apsw_module_setattr":
             return self.Proceed
-        if key[0] == 'PyObject_VectorcallMethod_NoAsync' and key[2]=="async_shutdown_controller":
+        if key[0] == "PyObject_VectorcallMethod_NoAsync" and key[2] == "async_shutdown_controller":
             # we can't fail this otherwise the worker thread keeps running forever
             return self.Proceed
         if "misuse_check" in key[4]:
@@ -1189,6 +1192,7 @@ class Tester:
 
         sys.excepthook = sys.__excepthook__
         sys.unraisablehook = sys.__unraisablehook__
+
 
 fractal_sql = """
     WITH RECURSIVE

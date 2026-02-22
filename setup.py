@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import shlex
 import glob
 import re
@@ -89,6 +90,10 @@ def write(*args):
         args = args[:-1]
     dest.write(" ".join(args) + "\n")
     dest.flush()
+
+
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ensure files are closed
@@ -198,8 +203,8 @@ class build_test_extension(Command):
 
         # unixy platforms have this, and is necessary to match the 32/64 bitness of Python itself
         if v("CC"):
-            cc = f"{ v('CC') } { v('CFLAGS') } { v('CCSHARED') } -Isqlite3 -c src/testextension.c"
-            ld = f"{ v('LDSHARED') } testextension.o -o { name }"
+            cc = f"{v('CC')} {v('CFLAGS')} {v('CCSHARED')} -Isqlite3 -c src/testextension.c"
+            ld = f"{v('LDSHARED')} testextension.o -o {name}"
 
             for cmd in cc, ld:
                 print(cmd)
@@ -234,7 +239,7 @@ fetch_parts = []
 class fetch(Command):
     description = "Automatically downloads SQLite and components"
     user_options = [
-        ("version=", None, f"Which version of SQLite/components to get (default { sqliteversion(version) })"),
+        ("version=", None, f"Which version of SQLite/components to get (default {sqliteversion(version)})"),
         ("missing-checksum-ok", None, "Continue on a missing checksum (default abort)"),
         ("sqlite", None, "Download SQLite amalgamation"),
         ("all", None, "Download all downloadable components"),
@@ -493,11 +498,15 @@ class apsw_build_ext(beparent):
             "Additional defines eg --definevalues SQLITE_MAX_ATTACHED=37,SQLITE_EXTRA_INIT=mycore_init",
         ),
         ("apsw-no-old-names", None, "Old non-PEP8 names are excluded"),
+        ("use-rust-module", None, "Build apsw.__init__ from crates/arsw-py"),
+        ("use-rust-unicode", None, "Build apsw._unicode from crates/arsw-unicode-py"),
     ]
     boolean_options = beparent.boolean_options + [
         "enable-all-extensions",
         "use-system-sqlite-config",
         "apsw-no-old-names",
+        "use-rust-module",
+        "use-rust-unicode",
     ]
 
     def initialize_options(self):
@@ -508,10 +517,44 @@ class apsw_build_ext(beparent):
         self.definevalues = None
         self.use_system_sqlite_config = False
         self.apsw_no_old_names = False
+        self.use_rust_module = env_flag("APSW_USE_RUST_MODULE")
+        self.use_rust_unicode = env_flag("APSW_USE_RUST_UNICODE")
         return v
 
     def finalize_options(self):
         v = beparent.finalize_options(self)
+
+        if self.use_rust_module:
+            if self.apsw_no_old_names:
+                raise OptionError("--apsw-no-old-names is not supported with --use-rust-module")
+
+            update_type_stubs_old_names(include_old=True)
+
+            # No C extension build when Rust module is selected.
+            self.extensions = [ext for ext in self.extensions if ext.name != "apsw.__init__"]
+
+            if self.use_rust_unicode:
+                self.extensions = [ext for ext in self.extensions if ext.name != "apsw._unicode"]
+
+            ignored = []
+            if self.enable:
+                ignored.append("--enable")
+            if self.omit:
+                ignored.append("--omit")
+            if self.enable_all_extensions:
+                ignored.append("--enable-all-extensions")
+            if self.use_system_sqlite_config:
+                ignored.append("--use-system-sqlite-config")
+            if self.definevalues:
+                ignored.append("--definevalues")
+            if ignored:
+                write(
+                    "SQLite: ignoring",
+                    ", ".join(ignored),
+                    "because --use-rust-module builds SQLite via cargo features",
+                )
+
+            return v
 
         if self.enable_all_extensions:
             if self.use_system_sqlite_config:
@@ -608,13 +651,13 @@ class apsw_build_ext(beparent):
         # sqlite3config.h used to be generated from configure output - now optional override file
         s3config = os.path.join(ext.include_dirs[0], "sqlite3config.h")
         if os.path.exists(s3config):
-            write(f"SQLite: Using your configuration { s3config }")
+            write(f"SQLite: Using your configuration {s3config}")
             ext.define_macros.append(("APSW_USE_SQLITE_CONFIG", "1"))
 
         # autosetup makes this file
         s3config = os.path.join(ext.include_dirs[0], "sqlite_cfg.h")
         if os.path.exists(s3config):
-            write(f"SQLite: Using configure generated { s3config }")
+            write(f"SQLite: Using configure generated {s3config}")
             ext.define_macros.append(("APSW_USE_SQLITE_CFG_H", "1"))
 
         # enables
@@ -694,10 +737,85 @@ class apsw_build_ext(beparent):
                 write("ICU: Unable to determine includes/libraries for ICU using pkg-config or icu-config")
 
         # done ...
+        if self.use_rust_unicode:
+            self.extensions = [ext for ext in self.extensions if ext.name != "apsw._unicode"]
+
         return v
+
+    def _build_rust_unicode(self):
+        cmd = ["cargo", "build", "-p", "arsw-unicode-py", "--message-format=json-render-diagnostics"]
+        if not self.debug:
+            cmd.append("--release")
+
+        write("Unicode: Building Rust extension via cargo")
+        res = subprocess.run(cmd, text=True, capture_output=True)
+        if res.returncode != 0:
+            raise RuntimeError("Failed building Rust unicode extension:\n" + res.stdout + "\n" + res.stderr)
+
+        built = None
+        for line in res.stdout.splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                message = json.loads(line)
+                if message.get("reason") != "compiler-artifact":
+                    continue
+                target = message.get("target", {})
+                if target.get("name") != "_unicode":
+                    continue
+                if "cdylib" not in target.get("crate_types", []):
+                    continue
+                for filename in message.get("filenames", []):
+                    suffix = pathlib.Path(filename).suffix.lower()
+                    if suffix in {".so", ".dylib", ".dll", ".pyd"}:
+                        built = filename
+
+        if not built:
+            raise RuntimeError("Unable to determine built Rust unicode extension artifact")
+
+        target = pathlib.Path(self.get_ext_fullpath("apsw._unicode"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built, target)
+        write("Unicode: Installed Rust extension to", str(target))
+
+    def _build_rust_module(self):
+        cmd = ["cargo", "build", "-p", "arsw-py", "--message-format=json-render-diagnostics"]
+        if not self.debug:
+            cmd.append("--release")
+
+        write("APSW: Building Rust module via cargo")
+        res = subprocess.run(cmd, text=True, capture_output=True)
+        if res.returncode != 0:
+            raise RuntimeError("Failed building Rust apsw module:\n" + res.stdout + "\n" + res.stderr)
+
+        built = None
+        for line in res.stdout.splitlines():
+            with contextlib.suppress(json.JSONDecodeError):
+                message = json.loads(line)
+                if message.get("reason") != "compiler-artifact":
+                    continue
+                target = message.get("target", {})
+                if target.get("name") != "apsw":
+                    continue
+                if "cdylib" not in target.get("crate_types", []):
+                    continue
+                for filename in message.get("filenames", []):
+                    suffix = pathlib.Path(filename).suffix.lower()
+                    if suffix in {".so", ".dylib", ".dll", ".pyd"}:
+                        built = filename
+
+        if not built:
+            raise RuntimeError("Unable to determine built Rust apsw extension artifact")
+
+        target = pathlib.Path(self.get_ext_fullpath("apsw.__init__"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built, target)
+        write("APSW: Installed Rust extension to", str(target))
 
     def run(self):
         v = beparent.run(self)
+        if self.use_rust_module:
+            self._build_rust_module()
+        if self.use_rust_unicode:
+            self._build_rust_unicode()
         return v
 
 
@@ -723,7 +841,7 @@ class apsw_sdist(sparent):
 
     def run(self):
         cfg = "pypi" if self.for_pypi else "default"
-        shutil.copy2(f"tools/setup-{ cfg }.cfg", "setup.apsw")
+        shutil.copy2(f"tools/setup-{cfg}.cfg", "setup.apsw")
         v = sparent.run(self)
 
         if self.add_doc:
@@ -732,6 +850,7 @@ class apsw_sdist(sparent):
             for archive in self.get_archive_files():
                 add_doc(archive, self.distribution.get_fullname())
         return v
+
 
 class apsw_patch_amalgamation(Command):
     description = "Patches amalgamation"
@@ -749,11 +868,13 @@ class apsw_patch_amalgamation(Command):
         if not patch_amalgamation():
             raise Exception("Failed to patch amalgamation")
 
+
 def get_amalgamation_version(filename):
     for line in pathlib.Path(filename).read_text(encoding="utf8").splitlines():
-        if mo:= re.match(r"^#define\s+SQLITE_VERSION_NUMBER\s+([0-9]{7})\s*$", line):
+        if mo := re.match(r"^#define\s+SQLITE_VERSION_NUMBER\s+([0-9]{7})\s*$", line):
             return int(mo.group(1))
     raise Exception(f"Unable to find version in {filename=}")
+
 
 # amalgamation patching
 def patch_amalgamation() -> bool:
@@ -902,8 +1023,8 @@ def set_config_from_system(outputfilename: str):
     os.makedirs(os.path.dirname(outputfilename), exist_ok=True)
     with open(outputfilename, "wt", encoding="utf8") as f:
         for c, v in sorted(configs.items()):
-            print(f"#undef  { c }", file=f)
-            print(f"#define { c } { v }", file=f)
+            print(f"#undef  {c}", file=f)
+            print(f"#define {c} {v}", file=f)
 
 
 def help_walker(arcdir):
@@ -994,8 +1115,7 @@ if __name__ == "__main__":
             "Framework :: Trio",
             "Framework :: AsyncIO",
             "Framework :: AnyIO",
-            "Framework :: AnyIO"
-            "Programming Language :: Python :: Implementation :: CPython",
+            "Framework :: AnyIOProgramming Language :: Python :: Implementation :: CPython",
         ],
         keywords=["database", "sqlite"],
         license="any-OSI",

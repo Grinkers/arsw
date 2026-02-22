@@ -1,0 +1,19 @@
+[package]
+name = "arsw-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "apsw"
+crate-type = ["cdylib"]
+
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["arsw/bundled-sqlite"]
+
+[dependencies]
+arsw = { version = "0.1.0", path = "../arsw" }
+pyo3 = { version = "0.28.2", features = ["abi3-py310", "extension-module"] }
+
+[lints]
+workspace = true

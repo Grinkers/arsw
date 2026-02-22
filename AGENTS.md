@@ -30,6 +30,16 @@ Notes:
 - Build extension in-place before running tests.
 - Use `.venv/bin/python` for Makefile targets that take `PYTHON=...`.
 - Keep `uv.lock` committed; dependency/version changes must update it.
+- Rust C-ABI header generation uses `cbindgen`; install with `cargo install cbindgen --locked`.
+- `cbindgen` may install into `$CARGO_HOME/bin` (or `$HOME/.cargo/bin`) which is not always on `PATH`.
+
+Containerized environment defaults in this repo:
+- Workspace root is mounted at `/opt`.
+- `UV_PROJECT_ENVIRONMENT=.slopvenv` (the active uv-managed virtualenv).
+- `UV_CACHE_DIR=/opt/.uvcache`.
+- `CARGO_HOME=/opt/.cargocache/cache`.
+- `CARGO_TARGET_DIR=/opt/.cargocache/target`.
+- Treat these cache paths as ephemeral container state (never commit cache contents).
 
 ## Build Commands
 Canonical local build:
@@ -45,6 +55,14 @@ Debug and packaging:
 - `uv run python setup.py sdist --for-pypi`
 - `make source`
 
+Rust workspace / C ABI workflow:
+- `cargo build`
+- `cargo test`
+- `make rust-capi-header` (writes `target/arsw.h`)
+
+Fresh clone note for Rust builds:
+- If `sqlite3/sqlite3.c` is missing, run `uv run python setup.py fetch --version=<sqlite-version> --all` before `cargo build`.
+
 ## Test Commands
 Full default workflow:
 - `make test`
@@ -53,6 +71,11 @@ Full default workflow:
 Run all tests directly:
 - `uv run python -m apsw.tests`
 - `uv run python -m apsw.tests -v`
+
+Linux timeout recommendation for long/full runs:
+- Prefer wrapping full-suite invocations with GNU `timeout` so hung runs fail fast in automation.
+- Example: `timeout 900 uv run python -m apsw.tests`
+- Example (verbose): `timeout 900 uv run python -m apsw.tests -v`
 
 Run a single test (preferred forms):
 - Single method in main suite:
@@ -83,6 +106,7 @@ Test environment flags used by suite:
 - `APSW_TEST_LARGE=t` enables large-object coverage.
 - `APSW_TEST_ITERATIONS=<N>` reruns entire suite N times.
 - `APSWTESTPREFIX=<path-prefix>` controls test temp file location.
+- For local/CI runs, prefer `APSWTESTPREFIX=target/` (create `target/` first if needed) so test artifacts stay under gitignored `target/`.
 
 ## Lint / Static Analysis / Formatting
 Configured in `pyproject.toml`:

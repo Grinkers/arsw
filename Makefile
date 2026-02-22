@@ -30,7 +30,7 @@ GENEXAMPLES = \
 
 .PHONY : help all tagpush clean doc docs build_ext build_ext_debug coverage pycoverage test test_debug fulltest linkcheck unwrapped \
 		 publish stubtest showsymbols compile-win setup-wheel source_nocheck source release pydebug \
-		 fossil doc-depends dev-depends docs-no-fetch compile-win-one langserver source_check_extracted checkversion
+		 fossil doc-depends dev-depends docs-no-fetch compile-win-one langserver rust-capi-header source_check_extracted checkversion
 
 help: ## Show this help
 	@egrep -h '\s##\s' $(MAKEFILE_LIST) | sort | \
@@ -308,6 +308,12 @@ pyfreethread: ## Build a debug FREE THREADED python
 
 langserver:  ## Language server integration json
 	$(PYTHON) tools/gencompilecommands.py > compile_commands.json
+
+rust-capi-header: ## Generates C header for arsw Rust C ABI
+	CBINDGEN_BIN="$$(command -v cbindgen || true)" ; \
+	if [ -z "$$CBINDGEN_BIN" ]; then CBINDGEN_BIN="$${CARGO_HOME:-$$HOME/.cargo}/bin/cbindgen" ; fi ; \
+	if [ ! -x "$$CBINDGEN_BIN" ]; then echo "cbindgen not found; install with: cargo install cbindgen --locked" ; exit 1 ; fi ; \
+	"$$CBINDGEN_BIN" --config crates/arsw/cbindgen.toml --crate arsw --output target/arsw.h
 
 megatest-build: ## Builds and updates podman container for running megatest
 	podman build --squash-all -t apsw-megatest -f tools/apsw-megatest-build

@@ -1,0 +1,15 @@
+[package]
+name = "arsw"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["bundled-sqlite"]
+bundled-sqlite = ["arsw-sqlite-ffi/bundled-sqlite"]
+async = []
+
+[dependencies]
+arsw-sqlite-ffi = { version = "0.1.0", path = "../arsw-sqlite-ffi" }
+
+[lints]
+workspace = true

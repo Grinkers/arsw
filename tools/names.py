@@ -54,12 +54,12 @@ def rst_gen():
         if klass == "apsw":
             kl = ":mod:`apsw`"
         else:
-            kl = f":class:`{ klass }`"
+            kl = f":class:`{klass}`"
         for new, old in sorted(members.items()):
             print(f"""\
-    * - { kl }
-      - :{ get_link(klass, new) }:`{ klass }.{ new }`
-      - :index:`{ old } <single: { old }; { klass }.{ new }>`""")
+    * - {kl}
+      - :{get_link(klass, new)}:`{klass}.{new}`
+      - :index:`{old} <single: {old}; {klass}.{new}>`""")
             kl = ""
 
 
@@ -80,13 +80,15 @@ def run_tests():
 
     old_source = re.sub("\\b(" + "|".join(subs.keys()) + ")\\b", repl, source)
 
-    for sub, repl in (
+    for sub, replacement in (
         ("from .ftstests import *", "from apsw.tests.ftstests import *"),
         ("from .sessiontests import *", "from apsw.tests.sessiontests import *"),
         ("from .jsonb import *", "from apsw.tests.jsonb import *"),
         ("from .carray import *", "from apsw.tests.carray import *"),
+        ("from .aiotest import *", "from apsw.tests.aiotest import *"),
+        ('getattr(self.db, "releasememory")', 'getattr(self.db, "release_memory")'),
     ):
-        old_source = old_source.replace(sub, repl)
+        old_source = old_source.replace(sub, replacement)
 
     module = types.ModuleType("tests")
     vars(module)["__file__"] = str(test_file_name)

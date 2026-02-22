@@ -1,0 +1,14 @@
+[package]
+name = "arsw-unicode-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_unicode"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28.2", features = ["abi3-py310", "extension-module"] }
+
+[lints]
+workspace = true

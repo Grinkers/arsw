@@ -1,0 +1,58 @@
+{
+  "probes": {
+    "argparse_apsw_version_extra_arg": {
+      "message": "apsw.apsw_version() takes no arguments (1 given)",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_complete_wrong_type": {
+      "message": "bad argument type for built-in operation",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_connection_missing_arg": {
+      "message": "Missing required parameter #1 'filename' of Connection.__init__(filename: str, flags: int = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, vfs: str | None = None, statementcachesize: int = 100)",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_exception_for_missing_arg": {
+      "message": "Missing required parameter #1 'code' of apsw.exception_for(code: int) -> Exception",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_exception_for_wrong_type": {
+      "message": "'str' object cannot be interpreted as an integer",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_format_sql_value_missing_arg": {
+      "message": "apsw.format_sql_value() takes exactly one argument (0 given)",
+      "raised": "builtins.TypeError"
+    },
+    "argparse_status_missing_arg": {
+      "message": "Missing required parameter #1 'op' of apsw.status(op: int, reset: bool = False) -> tuple[int, int]",
+      "raised": "builtins.TypeError"
+    },
+    "async_run_coro_default_is_none": true,
+    "getattr_missing_attribute": {
+      "message": "'APSWModule' object has no attribute 'this_attribute_should_not_exist_for_contract'",
+      "raised": "builtins.AttributeError"
+    },
+    "main_owner": "apsw.shell",
+    "repr_no_change": "<apsw.no_change>",
+    "setattr_async_controller_none": {
+      "message": "Do not overwrite apsw.async_controller.  It is a context var - use its set method in your context",
+      "raised": "builtins.AttributeError"
+    },
+    "setattr_async_cursor_prefetch_none": {
+      "message": "Do not overwrite apsw.async_cursor_prefetch.  It is a context var - use its set method in your context",
+      "raised": "builtins.AttributeError"
+    },
+    "setattr_async_run_coro_invalid": {
+      "message": "Expected None or a callable for async_run_coro, not int",
+      "raised": "builtins.TypeError"
+    },
+    "setattr_async_run_coro_valid_roundtrip": {
+      "raised": null,
+      "result_type": "builtins.bool"
+    },
+    "shell_owner": "apsw.shell",
+    "str_no_change": "<apsw.no_change>"
+  },
+  "schema_version": 1
+}
