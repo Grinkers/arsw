@@ -3,13 +3,28 @@ use super::*;
 #[pyclass(module = "apsw", name = "zeroblob")]
 pub(crate) struct ZeroBlob {
 	pub(crate) length: usize,
+	pub(crate) init_called: bool,
 }
 
 #[pymethods]
 impl ZeroBlob {
 	#[new]
 	fn py_new(length: usize) -> Self {
-		Self { length }
+		Self { length, init_called: false }
+	}
+
+	#[pyo3(signature = (*args, **kwargs))]
+	fn __init__(
+		&mut self,
+		args: &Bound<'_, PyTuple>,
+		kwargs: Option<&Bound<'_, PyDict>>,
+	) -> PyResult<()> {
+		let _ = (args, kwargs);
+		if self.init_called {
+			return Err(repeated_init_error());
+		}
+		self.init_called = true;
+		Ok(())
 	}
 
 	fn length(&self) -> usize {

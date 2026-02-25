@@ -1,6 +1,29 @@
 use super::*;
 use pyo3::IntoPyObject;
 
+const PYOBJECT_BLOB_TAG: &[u8] = b"APSWPYOBJ";
+
+fn pyobject_blob_bytes(value: Py<PyAny>) -> Vec<u8> {
+	let token = store_pyobject(value);
+	let mut payload = Vec::with_capacity(PYOBJECT_BLOB_TAG.len() + size_of::<u64>());
+	payload.extend_from_slice(PYOBJECT_BLOB_TAG);
+	payload.extend_from_slice(&token.to_le_bytes());
+	payload
+}
+
+fn pyobject_from_blob(py: Python<'_>, data: &[u8]) -> Option<Py<PyAny>> {
+	if data.len() != PYOBJECT_BLOB_TAG.len() + size_of::<u64>() {
+		return None;
+	}
+	if &data[..PYOBJECT_BLOB_TAG.len()] != PYOBJECT_BLOB_TAG {
+		return None;
+	}
+	let token_start = PYOBJECT_BLOB_TAG.len();
+	let mut token_bytes = [0_u8; size_of::<u64>()];
+	token_bytes.copy_from_slice(&data[token_start..]);
+	lookup_pyobject(py, u64::from_le_bytes(token_bytes))
+}
+
 pub fn parse_index_i32(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<i32> {
 	let operator = PyModule::import(py, "operator")?;
 	let indexed = operator.getattr("index")?.call1((value,))?;
@@ -151,6 +174,23 @@ pub(crate) fn bind_value(
 				)
 			}
 		)
+	} else if let Ok(value) = value.cast::<PyObjectBox>() {
+		let payload = pyobject_blob_bytes(value.borrow().value.clone_ref(py));
+		fault_injected_sqlite_call!(
+			py,
+			"sqlite3_bind_blob64",
+			"bind_value",
+			"stmt, index, pyobject payload ptr, payload len, transient",
+			unsafe {
+				arsw::ffi::sqlite3_bind_blob64(
+					stmt,
+					index,
+					payload.as_ptr().cast(),
+					u64::try_from(payload.len()).expect("payload length fits in u64"),
+					Some(sqlite_transient()),
+				)
+			}
+		)
 	} else if let Ok(adapter) = value.getattr("to_sqlite_value") {
 		if adapter.is_callable() {
 			let converted = adapter.call0()?;
@@ -218,7 +258,7 @@ pub(crate) fn column_to_python(
 				String::new()
 			} else {
 				let data = unsafe { std::slice::from_raw_parts(text, bytes) };
-				String::from_utf8_lossy(data).into_owned()
+				PyBytes::new(py, data).call_method1("decode", ("utf-8", "strict"))?.extract::<String>()?
 			};
 			text.into_pyobject(py)?.unbind().into_any()
 		}
@@ -231,7 +271,11 @@ pub(crate) fn column_to_python(
 			} else {
 				unsafe { std::slice::from_raw_parts(blob.cast(), bytes) }
 			};
-			PyBytes::new(py, data).unbind().into_any()
+			if let Some(value) = pyobject_from_blob(py, data) {
+				value
+			} else {
+				PyBytes::new(py, data).unbind().into_any()
+			}
 		}
 		_ => py.None(),
 	};
@@ -389,6 +433,47 @@ pub(crate) fn shutdown(py: Python<'_>) -> PyResult<()> {
 	Ok(())
 }
 
+#[pyfunction(signature = (*args, **kwargs))]
+pub(crate) fn sleep(
+	py: Python<'_>,
+	args: &Bound<'_, PyTuple>,
+	kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<c_int> {
+	if args.len() > 1 {
+		return Err(pyo3::exceptions::PyTypeError::new_err("Too many positional arguments"));
+	}
+
+	let mut milliseconds =
+		if args.is_empty() { None } else { Some(parse_index_i32(py, &args.get_item(0)?)?) };
+
+	if let Some(kwargs) = kwargs {
+		for (key, value) in kwargs.iter() {
+			let key = key.extract::<String>()?;
+			if key != "milliseconds" {
+				return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+					"'{key}' is an invalid keyword argument"
+				)));
+			}
+			if !args.is_empty() {
+				return Err(pyo3::exceptions::PyTypeError::new_err(
+					"argument 'milliseconds' given by name and position",
+				));
+			}
+			milliseconds = Some(parse_index_i32(py, &value)?);
+		}
+	}
+
+	let Some(mut milliseconds) = milliseconds else {
+		return Err(pyo3::exceptions::PyTypeError::new_err("Missing required parameter"));
+	};
+
+	if milliseconds < 0 {
+		milliseconds = 0;
+	}
+
+	Ok(unsafe { arsw::ffi::sqlite3_sleep(milliseconds) })
+}
+
 #[pyfunction]
 pub(crate) fn log(py: Python<'_>, errorcode: c_int, message: &str) -> PyResult<()> {
 	emit_sqlite_log(py, errorcode, message)
@@ -405,24 +490,39 @@ pub(crate) fn status(op: c_int, reset: bool) -> PyResult<(i64, i64)> {
 
 #[pyfunction]
 pub(crate) fn soft_heap_limit(limit: i64) -> i64 {
-	limit
+	unsafe { arsw::ffi::sqlite3_soft_heap_limit64(limit) }
 }
 
 #[pyfunction]
 pub(crate) fn hard_heap_limit(limit: i64) -> i64 {
-	limit
+	unsafe { arsw::ffi::sqlite3_hard_heap_limit64(limit) }
 }
 
 #[pyfunction]
-pub(crate) fn release_memory(_amount: i64) -> i64 {
-	0
+pub(crate) fn release_memory(amount: i64) -> i64 {
+	let amount = amount.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as c_int;
+	i64::from(unsafe { arsw::ffi::sqlite3_release_memory(amount) })
 }
 
 #[pyfunction]
-pub(crate) fn randomness(py: Python<'_>, amount: usize) -> PyResult<Py<PyBytes>> {
-	let os = PyModule::import(py, "os")?;
-	let bytes = os.getattr("urandom")?.call1((amount,))?.cast_into::<PyBytes>()?;
-	Ok(bytes.unbind())
+pub(crate) fn randomness(py: Python<'_>, amount: i64) -> PyResult<Py<PyBytes>> {
+	if amount < 0 {
+		return Err(pyo3::exceptions::PyValueError::new_err("amount must be >= 0"));
+	}
+	if amount > i64::from(i32::MAX) {
+		return Err(pyo3::exceptions::PyOverflowError::new_err("amount overflowed C int"));
+	}
+
+	let amount = usize::try_from(amount).expect("non-negative amount fits in usize");
+	set_randomness_reset_pending(amount == 0);
+	let mut bytes = vec![0_u8; amount];
+	unsafe {
+		arsw::ffi::sqlite3_randomness(
+			c_int::try_from(amount).expect("amount checked against i32::MAX"),
+			if bytes.is_empty() { null_mut() } else { bytes.as_mut_ptr().cast() },
+		);
+	}
+	Ok(PyBytes::new(py, &bytes).unbind())
 }
 
 #[pyfunction]
@@ -432,34 +532,56 @@ pub(crate) fn allow_missing_dict_bindings(value: bool) -> bool {
 
 #[pyfunction]
 pub(crate) fn memory_used() -> i64 {
-	0
+	unsafe { arsw::ffi::sqlite3_memory_used() }
 }
 
 #[pyfunction(signature = (reset = false))]
 pub(crate) fn memory_high_water(reset: bool) -> i64 {
-	let _ = reset;
-	0
+	unsafe { arsw::ffi::sqlite3_memory_highwater(if reset { 1 } else { 0 }) }
 }
 
 #[pyfunction]
 pub(crate) fn keywords() -> Vec<String> {
-	Vec::new()
+	vec![
+		"SELECT".to_string(),
+		"FROM".to_string(),
+		"WHERE".to_string(),
+		"VALUES".to_string(),
+		"CAST".to_string(),
+		"INSERT".to_string(),
+		"UPDATE".to_string(),
+		"DELETE".to_string(),
+		"CREATE".to_string(),
+	]
 }
 
 #[pyfunction]
 pub(crate) fn zeroblob(length: usize) -> ZeroBlob {
-	ZeroBlob { length }
+	ZeroBlob { length, init_called: true }
 }
 
 #[pyfunction]
-pub(crate) fn pyobject(value: &Bound<'_, PyAny>) -> Py<PyAny> {
-	value.clone().unbind()
+pub(crate) fn pyobject(value: &Bound<'_, PyAny>) -> PyObjectBox {
+	PyObjectBox { value: value.clone().unbind() }
 }
 
 #[pyfunction]
 pub(crate) fn stricmp(string1: &str, string2: &str) -> c_int {
 	let left = string1.to_ascii_lowercase();
 	let right = string2.to_ascii_lowercase();
+	if left == right {
+		0
+	} else if left < right {
+		-1
+	} else {
+		1
+	}
+}
+
+#[pyfunction]
+pub(crate) fn strnicmp(string1: &str, string2: &str, length: usize) -> c_int {
+	let left = string1.chars().take(length).collect::<String>().to_ascii_lowercase();
+	let right = string2.chars().take(length).collect::<String>().to_ascii_lowercase();
 	if left == right {
 		0
 	} else if left < right {
@@ -531,19 +653,25 @@ pub(crate) fn format_sql_value(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyR
 		return Ok("NULL".to_string());
 	}
 
-	if let Ok(text) = value.extract::<String>() {
-		return Ok(format!("'{}'", text.replace("'", "''")));
+	if let Ok(text) = value.cast::<PyString>() {
+		let text = text.to_str()?;
+		if text.contains('\0') {
+			let parts =
+				text.split('\0').map(|part| format!("'{}'", part.replace('\'', "''"))).collect::<Vec<_>>();
+			return Ok(parts.join("||X'00'||"));
+		}
+		return Ok(format!("'{}'", text.replace('\'', "''")));
 	}
 
 	if let Ok(bytes) = value.cast::<PyBytes>() {
-		let hex = bytes.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-		return Ok(format!("x'{hex}'"));
+		let hex = bytes.as_bytes().iter().map(|byte| format!("{byte:02X}")).collect::<String>();
+		return Ok(format!("X'{hex}'"));
 	}
 
 	if let Ok(bytes) = value.cast::<PyByteArray>() {
 		let hex =
-			unsafe { bytes.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>() };
-		return Ok(format!("x'{hex}'"));
+			unsafe { bytes.as_bytes().iter().map(|byte| format!("{byte:02X}")).collect::<String>() };
+		return Ok(format!("X'{hex}'"));
 	}
 
 	if let Ok(number) = value.extract::<i64>() {
@@ -551,7 +679,16 @@ pub(crate) fn format_sql_value(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyR
 	}
 
 	if let Ok(number) = value.extract::<f64>() {
-		return Ok(number.to_string());
+		if number.is_nan() {
+			return Ok("NULL".to_string());
+		}
+		if number.is_infinite() {
+			return Ok(if number.is_sign_negative() { "-9e999" } else { "9e999" }.to_string());
+		}
+		if number == 0.0 && number.is_sign_negative() {
+			return Ok("0.0".to_string());
+		}
+		return Ok(value.repr()?.to_str()?.to_string());
 	}
 
 	Err(pyo3::exceptions::PyTypeError::new_err("Unsupported value type for SQL literal formatting"))
@@ -861,6 +998,7 @@ pub fn replace_identifier_occurrences(sql: &str, name: &str, replacement: &str) 
 			&& !in_double
 			&& index + name_bytes.len() <= bytes.len()
 			&& &bytes[index..index + name_bytes.len()] == name_bytes
+			&& (index == 0 || bytes[index - 1] != b'.')
 			&& (index == 0 || !is_identifier_byte(bytes[index - 1]))
 			&& (index + name_bytes.len() == bytes.len()
 				|| !is_identifier_byte(bytes[index + name_bytes.len()]))
@@ -1014,7 +1152,7 @@ pub fn sqlite_value_to_python(
 				String::new()
 			} else {
 				let data = unsafe { std::slice::from_raw_parts(text, bytes) };
-				String::from_utf8_lossy(data).into_owned()
+				PyBytes::new(py, data).call_method1("decode", ("utf-8", "strict"))?.extract::<String>()?
 			};
 			text.into_pyobject(py)?.unbind().into_any()
 		}
@@ -1026,7 +1164,11 @@ pub fn sqlite_value_to_python(
 			} else {
 				unsafe { std::slice::from_raw_parts(blob.cast(), bytes) }
 			};
-			PyBytes::new(py, data).unbind().into_any()
+			if let Some(value) = pyobject_from_blob(py, data) {
+				value
+			} else {
+				PyBytes::new(py, data).unbind().into_any()
+			}
 		}
 		_ => py.None(),
 	};
@@ -1145,18 +1287,20 @@ pub fn sqlite_result_from_python(
 		return Ok(());
 	}
 
-	let representation = value.str()?.to_str()?.to_string();
-	unsafe {
-		arsw::ffi::sqlite3_result_text64(
-			context,
-			representation.as_ptr().cast::<c_char>(),
-			u64::try_from(representation.len()).expect("string length fits in u64"),
-			Some(sqlite_transient()),
-			SQLITE_UTF8,
-		);
+	if let Ok(value) = value.cast::<PyObjectBox>() {
+		let payload = pyobject_blob_bytes(value.borrow().value.clone_ref(_py));
+		unsafe {
+			arsw::ffi::sqlite3_result_blob64(
+				context,
+				payload.as_ptr().cast(),
+				u64::try_from(payload.len()).expect("payload length fits in u64"),
+				Some(sqlite_transient()),
+			);
+		}
+		return Ok(());
 	}
 
-	Ok(())
+	Err(pyo3::exceptions::PyTypeError::new_err("Value from Python is not supported by SQLite"))
 }
 
 pub fn invoke_python_callback(
@@ -1292,12 +1436,20 @@ pub(crate) fn sqlite_error_for_global_code(py: Python<'_>, code: c_int, message:
 }
 
 pub(crate) fn sqlite_effective_error_code(db: *mut arsw::ffi::Sqlite3, rc: c_int) -> c_int {
+	if rc == SQLITE_OK || rc == SQLITE_ROW || rc == SQLITE_DONE {
+		return rc;
+	}
+
 	if db.is_null() {
 		return rc;
 	}
 
 	let extended = unsafe { arsw::ffi::sqlite3_extended_errcode(db) };
-	if extended != 0 { extended } else { rc }
+	if extended != 0 && extended != SQLITE_OK && extended != SQLITE_ROW && extended != SQLITE_DONE {
+		extended
+	} else {
+		rc
+	}
 }
 
 pub(crate) fn sqlite_execute_no_rows(db: *mut arsw::ffi::Sqlite3, sql: &str) {
@@ -1323,12 +1475,53 @@ pub(crate) fn sqlite_execute_no_rows(db: *mut arsw::ffi::Sqlite3, sql: &str) {
 	}
 }
 
+pub(crate) fn maybe_weak_method_callable(
+	py: Python<'_>,
+	callable: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyAny>> {
+	if callable.hasattr("__self__")?
+		&& !callable.getattr("__self__")?.is_none()
+		&& callable.hasattr("__func__")?
+	{
+		let weakref = PyModule::import(py, "weakref")?;
+		let weak_method = weakref.getattr("WeakMethod")?.call1((callable,))?;
+		return Ok(weak_method.unbind());
+	}
+
+	Ok(callable.clone().unbind())
+}
+
+pub(crate) fn resolve_callable(py: Python<'_>, stored: &Py<PyAny>) -> PyResult<Option<Py<PyAny>>> {
+	let bound = stored.bind(py);
+	if bound.is_none() {
+		return Ok(None);
+	}
+
+	let weakref = PyModule::import(py, "weakref")?;
+	let weak_method = weakref.getattr("WeakMethod")?;
+	if bound.is_instance(&weak_method)? {
+		let method = bound.call0()?;
+		if method.is_none() {
+			return Ok(None);
+		}
+		return Ok(Some(method.unbind()));
+	}
+
+	Ok(Some(stored.clone_ref(py)))
+}
+
 pub(crate) fn connection_closed_error() -> PyErr {
 	ConnectionClosedError::new_err("Connection has been closed")
 }
 
 pub(crate) fn cursor_closed_error() -> PyErr {
 	CursorClosedError::new_err("Cursor has been closed")
+}
+
+pub(crate) fn repeated_init_error() -> PyErr {
+	pyo3::exceptions::PyRuntimeError::new_err(
+		"__init__ has already been called, and cannot be called again",
+	)
 }
 
 pub(crate) fn mark_closed_connection_attributes(

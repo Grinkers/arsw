@@ -1,7 +1,4 @@
 use core::ffi::{c_char, c_int, c_void};
-use std::collections::HashMap;
-use std::ptr;
-use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -23,37 +20,52 @@ const SQLITE_STMTSTATUS_FILTER_MISS: c_int = 7;
 const SQLITE_STMTSTATUS_FILTER_HIT: c_int = 8;
 const SQLITE_STMTSTATUS_MEMUSED: c_int = 9;
 
-pub(crate) struct TraceContext {
+pub(crate) struct TraceHook {
 	pub callback: Py<PyAny>,
 	pub mask: c_int,
 	pub id: Option<Py<PyAny>>,
-	pub db: *mut arsw::ffi::Sqlite3,
-	pub connection: Py<PyAny>,
-	stmt_status_initial: Mutex<HashMap<usize, StmtStatus>>,
 }
 
-#[derive(Default, Clone)]
-struct StmtStatus {
-	fullscan_step: i32,
-	sort: i32,
-	autoindex: i32,
-	vm_step: i32,
-	reprepare: i32,
-	run: i32,
-	filter_miss: i32,
-	filter_hit: i32,
-	memused: i32,
+impl TraceHook {
+	pub fn clone_ref(&self, py: Python<'_>) -> Self {
+		Self {
+			callback: self.callback.clone_ref(py),
+			mask: self.mask,
+			id: self.id.as_ref().map(|id| id.clone_ref(py)),
+		}
+	}
+}
+
+pub(crate) struct TraceContext {
+	pub hooks: Vec<TraceHook>,
+	pub db: *mut arsw::ffi::Sqlite3,
+	pub connection: Py<PyAny>,
 }
 
 impl TraceContext {
-	pub fn new(
-		callback: Py<PyAny>,
-		mask: c_int,
-		id: Option<Py<PyAny>>,
-		db: *mut arsw::ffi::Sqlite3,
-		connection: Py<PyAny>,
-	) -> Self {
-		Self { callback, mask, id, db, connection, stmt_status_initial: Mutex::new(HashMap::new()) }
+	pub fn new(hooks: Vec<TraceHook>, db: *mut arsw::ffi::Sqlite3, connection: Py<PyAny>) -> Self {
+		Self { hooks, db, connection }
+	}
+
+	fn has_profile_listener(&self) -> bool {
+		self.hooks.iter().any(|hook| hook.mask & SQLITE_TRACE_PROFILE != 0)
+	}
+
+	fn has_trace_listener_for(&self, code: c_int) -> bool {
+		self.hooks.iter().any(|hook| hook.mask & code != 0)
+	}
+
+	fn combined_mask(&self) -> c_int {
+		let mut mask = 0;
+		for hook in &self.hooks {
+			mask |= hook.mask;
+		}
+
+		if mask & SQLITE_TRACE_PROFILE != 0 {
+			mask |= SQLITE_TRACE_STMT;
+		}
+
+		mask
 	}
 }
 
@@ -63,15 +75,17 @@ unsafe extern "C" fn trace_callback(
 	one: *mut c_void,
 	two: *mut c_void,
 ) -> c_int {
+	if p_ctx.is_null() {
+		return 0;
+	}
+
 	let ctx = unsafe { &*(p_ctx as *const TraceContext) };
 	let db = ctx.db;
 
-	Python::try_attach(|py| -> PyResult<c_int> {
-		let total_changes = unsafe { arsw::ffi::sqlite3_total_changes64(db) };
-
-		let event = PyDict::new(py);
-
-		event.set_item("code", code)?;
+	let Some(result) = Python::try_attach(|py| {
+		let wants_event = ctx.has_trace_listener_for(code);
+		let mut event: Option<Py<PyDict>> = None;
+		let mut first_error: Option<PyErr> = None;
 
 		match code {
 			SQLITE_TRACE_STMT => {
@@ -85,165 +99,175 @@ unsafe extern "C" fn trace_callback(
 				let trigger = sql.starts_with("-- ");
 				let sql = if trigger { &sql[3..] } else { sql };
 
-				let id = one as usize;
-				event.set_item("id", id)?;
+				if !trigger && ctx.has_profile_listener() {
+					unsafe {
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_SORT, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_AUTOINDEX, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_REPREPARE, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_RUN, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_MISS, 1);
+						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_HIT, 1);
+					}
+				}
 
-				let sql_str = sql.to_string();
-				event.set_item("sql", sql_str)?;
-
-				event.set_item("trigger", trigger)?;
-				event.set_item("connection", ctx.connection.clone_ref(py))?;
-				event.set_item("total_changes", total_changes)?;
-
-				let readonly = unsafe { arsw::ffi::sqlite3_stmt_readonly(stmt) } != 0;
-				event.set_item("readonly", readonly)?;
-
-				let explain = unsafe { arsw::ffi::sqlite3_stmt_isexplain(stmt) };
-				event.set_item("explain", explain)?;
-
-				if ctx.mask & SQLITE_TRACE_PROFILE != 0 {
-					let mut status = StmtStatus::default();
-					status.fullscan_step =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1) };
-					status.sort = unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_SORT, 1) };
-					status.autoindex =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_AUTOINDEX, 1) };
-					status.vm_step =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 1) };
-					status.reprepare =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_REPREPARE, 1) };
-					status.run = unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_RUN, 1) };
-					status.filter_miss =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_MISS, 1) };
-					status.filter_hit =
-						unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_HIT, 1) };
-
-					let stmt_ptr = stmt as usize;
-					if let Ok(mut guard) = ctx.stmt_status_initial.lock() {
-						guard.insert(stmt_ptr, status);
+				if wants_event {
+					let total_changes = unsafe { arsw::ffi::sqlite3_total_changes64(db) };
+					let event_dict = PyDict::new(py);
+					if let Err(err) = (|| -> PyResult<()> {
+						event_dict.set_item("code", code)?;
+						event_dict.set_item("id", one as usize)?;
+						event_dict.set_item("sql", sql)?;
+						event_dict.set_item("trigger", trigger)?;
+						event_dict.set_item("connection", ctx.connection.clone_ref(py))?;
+						event_dict.set_item("total_changes", total_changes)?;
+						event_dict
+							.set_item("readonly", unsafe { arsw::ffi::sqlite3_stmt_readonly(stmt) } != 0)?;
+						event_dict.set_item("explain", unsafe { arsw::ffi::sqlite3_stmt_isexplain(stmt) })?;
+						Ok(())
+					})() {
+						first_error = Some(err);
+					} else {
+						event = Some(event_dict.unbind());
 					}
 				}
 			}
 
 			SQLITE_TRACE_ROW => {
-				let id = one as usize;
-				event.set_item("id", id)?;
-				event.set_item("connection", ctx.connection.clone_ref(py))?;
+				if wants_event {
+					let event_dict = PyDict::new(py);
+					if let Err(err) = (|| -> PyResult<()> {
+						event_dict.set_item("code", code)?;
+						event_dict.set_item("id", one as usize)?;
+						event_dict.set_item("connection", ctx.connection.clone_ref(py))?;
+						Ok(())
+					})() {
+						first_error = Some(err);
+					} else {
+						event = Some(event_dict.unbind());
+					}
+				}
 			}
 
 			SQLITE_TRACE_PROFILE => {
 				let stmt = one as *mut arsw::ffi::Sqlite3Stmt;
-				let nanoseconds = two as *mut i64;
-				let nanoseconds_val = unsafe { *nanoseconds };
+				let nanoseconds =
+					if two.is_null() { 0 } else { unsafe { *(two as *const arsw::ffi::Sqlite3Int64) } };
+				let nanoseconds = if nanoseconds > 0 { nanoseconds } else { 1 };
+				if wants_event {
+					let sql = unsafe { arsw::ffi::sqlite3_sql(stmt) };
+					let sql = if sql.is_null() {
+						String::new()
+					} else {
+						unsafe { std::ffi::CStr::from_ptr(sql).to_string_lossy().into_owned() }
+					};
+					let total_changes = unsafe { arsw::ffi::sqlite3_total_changes64(db) };
+					let event_dict = PyDict::new(py);
+					if let Err(err) = (|| -> PyResult<()> {
+						event_dict.set_item("code", code)?;
+						event_dict.set_item("id", one as usize)?;
+						event_dict.set_item("sql", sql)?;
+						event_dict.set_item("connection", ctx.connection.clone_ref(py))?;
+						event_dict.set_item("total_changes", total_changes)?;
+						event_dict.set_item("nanoseconds", nanoseconds)?;
 
-				let sql = unsafe { arsw::ffi::sqlite3_sql(stmt) };
-				let sql_str = if sql.is_null() {
-					String::new()
-				} else {
-					unsafe { std::ffi::CStr::from_ptr(sql).to_str().unwrap_or("").to_string() }
-				};
+						let stmt_status = PyDict::new(py);
+						stmt_status.set_item("SQLITE_STMTSTATUS_FULLSCAN_STEP", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_SORT", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_SORT, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_AUTOINDEX", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_AUTOINDEX, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_VM_STEP", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_REPREPARE", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_REPREPARE, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_RUN", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_RUN, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_FILTER_MISS", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_MISS, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_FILTER_HIT", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0)
+						} as i64)?;
+						stmt_status.set_item("SQLITE_STMTSTATUS_MEMUSED", unsafe {
+							arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_MEMUSED, 0)
+						} as i64)?;
+						event_dict.set_item("stmt_status", stmt_status)?;
 
-				let id = one as usize;
-				event.set_item("id", id)?;
-				event.set_item("sql", sql_str)?;
-				event.set_item("connection", ctx.connection.clone_ref(py))?;
-				event.set_item("total_changes", total_changes)?;
-				event.set_item("nanoseconds", nanoseconds_val)?;
-
-				let stmt_status = PyDict::new(py);
-
-				let current = StmtStatus {
-					fullscan_step: unsafe {
-						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0)
-					},
-					sort: unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_SORT, 0) },
-					autoindex: unsafe {
-						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_AUTOINDEX, 0)
-					},
-					vm_step: unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_VM_STEP, 0) },
-					reprepare: unsafe {
-						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_REPREPARE, 0)
-					},
-					run: unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_RUN, 0) },
-					filter_miss: unsafe {
-						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_MISS, 0)
-					},
-					filter_hit: unsafe {
-						arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0)
-					},
-					memused: unsafe { arsw::ffi::sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_MEMUSED, 0) },
-				};
-
-				let stmt_ptr = stmt as usize;
-				let initial = if let Ok(guard) = ctx.stmt_status_initial.lock() {
-					guard.get(&stmt_ptr).cloned()
-				} else {
-					None
-				};
-
-				if let Some(initial) = initial {
-					stmt_status.set_item(
-						"SQLITE_STMTSTATUS_FULLSCAN_STEP",
-						(current.fullscan_step - initial.fullscan_step) as i64,
-					)?;
-					stmt_status.set_item("SQLITE_STMTSTATUS_SORT", (current.sort - initial.sort) as i64)?;
-					stmt_status.set_item(
-						"SQLITE_STMTSTATUS_AUTOINDEX",
-						(current.autoindex - initial.autoindex) as i64,
-					)?;
-					stmt_status
-						.set_item("SQLITE_STMTSTATUS_VM_STEP", (current.vm_step - initial.vm_step) as i64)?;
-					stmt_status.set_item(
-						"SQLITE_STMTSTATUS_REPREPARE",
-						(current.reprepare - initial.reprepare) as i64,
-					)?;
-					stmt_status.set_item("SQLITE_STMTSTATUS_RUN", (current.run - initial.run) as i64)?;
-					stmt_status.set_item(
-						"SQLITE_STMTSTATUS_FILTER_MISS",
-						(current.filter_miss - initial.filter_miss) as i64,
-					)?;
-					stmt_status.set_item(
-						"SQLITE_STMTSTATUS_FILTER_HIT",
-						(current.filter_hit - initial.filter_hit) as i64,
-					)?;
-					stmt_status
-						.set_item("SQLITE_STMTSTATUS_MEMUSED", (current.memused - initial.memused) as i64)?;
+						Ok(())
+					})() {
+						first_error = Some(err);
+					} else {
+						event = Some(event_dict.unbind());
+					}
 				}
-
-				event.set_item("stmt_status", stmt_status)?;
 			}
 
 			SQLITE_TRACE_CLOSE => {
-				event.set_item("code", code)?;
-				let conn: Py<PyAny> = py.None();
-				event.set_item("connection", conn)?;
+				if wants_event {
+					let event_dict = PyDict::new(py);
+					if let Err(err) = (|| -> PyResult<()> {
+						event_dict.set_item("code", code)?;
+						event_dict.set_item("connection", ctx.connection.clone_ref(py))?;
+						Ok(())
+					})() {
+						first_error = Some(err);
+					} else {
+						event = Some(event_dict.unbind());
+					}
+				}
 			}
 
 			_ => {}
 		}
 
-		let id = ctx.id.as_ref().map(|id| id.clone_ref(py));
-		let callback = ctx.callback.clone_ref(py);
+		if let Some(event) = event {
+			let event = event.bind(py);
+			for hook in &ctx.hooks {
+				if hook.mask & code == 0 {
+					continue;
+				}
 
-		if let Some(id) = id {
-			callback.call1(py, (event, id))?;
-		} else {
-			callback.call1(py, (event,))?;
+				let callback = hook.callback.bind(py);
+				let _id = hook.id.as_ref();
+				let call_result = callback.call1((event.clone(),));
+
+				if let Err(err) = call_result {
+					if first_error.is_none() {
+						first_error = Some(err.clone_ref(py));
+					}
+				}
+			}
 		}
 
-		Ok(0)
-	})
-	.map_or(0, |r| r.unwrap_or(0))
+		if let Some(err) = first_error {
+			set_callback_error(py, &err);
+		}
+
+		0
+	}) else {
+		return 0;
+	};
+
+	result
 }
 
-pub(crate) fn register_trace(py: Python<'_>, ctx: &TraceContext) -> PyResult<()> {
+pub(crate) fn register_trace(_py: Python<'_>, ctx: &TraceContext) -> PyResult<()> {
 	let db = ctx.db;
 
 	if db.is_null() {
 		return Err(pyo3::exceptions::PyRuntimeError::new_err("Database connection is closed"));
 	}
 
-	let mask = ctx.mask;
+	let mask = ctx.combined_mask();
 	if mask == 0 {
 		return Ok(());
 	}
@@ -276,11 +300,8 @@ pub(crate) fn unregister_trace(
 	}
 
 	unsafe {
-		// When mask is 0, SQLite ignores the callback but uses the context
-		// to identify which trace to unregister. Pass the original context.
 		let result = arsw::ffi::sqlite3_trace_v2(db, 0, None, ctx_ptr.unwrap_or(std::ptr::null_mut()));
 		if result != 0 && result != 21 {
-			// 21 is SQLITE_MISUSE
 			return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
 				"Failed to unregister trace callback: {}",
 				result

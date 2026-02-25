@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_int, c_uchar, c_void};
+use core::ffi::{c_char, c_int, c_uchar, c_uint, c_void};
 
 pub type Sqlite3Int64 = i64;
 pub type Sqlite3UInt64 = u64;
@@ -18,6 +18,7 @@ pub type Sqlite3SessionFilterCallback =
 	Option<unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int>;
 pub type Sqlite3TraceCallback =
 	Option<unsafe extern "C" fn(c_int, *mut c_void, *mut c_void, *mut c_void) -> c_int>;
+pub type Sqlite3ProgressCallback = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -106,6 +107,8 @@ unsafe extern "C" {
 	pub fn sqlite3_close_v2(db: *mut Sqlite3) -> c_int;
 	pub fn sqlite3_changes64(db: *mut Sqlite3) -> Sqlite3Int64;
 	pub fn sqlite3_total_changes64(db: *mut Sqlite3) -> Sqlite3Int64;
+	pub fn sqlite3_last_insert_rowid(db: *mut Sqlite3) -> Sqlite3Int64;
+	pub fn sqlite3_set_last_insert_rowid(db: *mut Sqlite3, value: Sqlite3Int64);
 	pub fn sqlite3_db_filename(db: *mut Sqlite3, z_db_name: *const c_char) -> *const c_char;
 	pub fn sqlite3_db_readonly(db: *mut Sqlite3, z_db_name: *const c_char) -> c_int;
 	pub fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char;
@@ -249,8 +252,11 @@ unsafe extern "C" {
 	pub fn sqlite3_value_text(value: *mut Sqlite3Value) -> *const c_uchar;
 	pub fn sqlite3_value_blob(value: *mut Sqlite3Value) -> *const c_void;
 	pub fn sqlite3_value_bytes(value: *mut Sqlite3Value) -> c_int;
+	pub fn sqlite3_malloc64(n: Sqlite3UInt64) -> *mut c_void;
 	pub fn sqlite3_free(p: *mut c_void);
 	pub fn sqlite3_vfs_find(z_vfs_name: *const c_char) -> *mut Sqlite3Vfs;
+	pub fn sqlite3_vfs_register(vfs: *mut Sqlite3Vfs, make_dflt: c_int) -> c_int;
+	pub fn sqlite3_vfs_unregister(vfs: *mut Sqlite3Vfs) -> c_int;
 	pub fn sqlite3session_create(
 		db: *mut Sqlite3,
 		z_db: *const c_char,
@@ -313,7 +319,38 @@ unsafe extern "C" {
 		callback: Sqlite3TraceCallback,
 		p_ctx: *mut c_void,
 	) -> c_int;
+	pub fn sqlite3_interrupt(db: *mut Sqlite3);
+	pub fn sqlite3_is_interrupted(db: *mut Sqlite3) -> c_int;
+	pub fn sqlite3_randomness(n: c_int, p: *mut c_void);
+	pub fn sqlite3_sleep(milliseconds: c_int) -> c_int;
+	pub fn sqlite3_busy_timeout(db: *mut Sqlite3, milliseconds: c_int) -> c_int;
+	pub fn sqlite3_progress_handler(
+		db: *mut Sqlite3,
+		n_ops: c_int,
+		callback: Sqlite3ProgressCallback,
+		p_arg: *mut c_void,
+	);
+	pub fn sqlite3_memory_used() -> Sqlite3Int64;
+	pub fn sqlite3_memory_highwater(reset_flag: c_int) -> Sqlite3Int64;
+	pub fn sqlite3_soft_heap_limit64(n: Sqlite3Int64) -> Sqlite3Int64;
+	pub fn sqlite3_hard_heap_limit64(n: Sqlite3Int64) -> Sqlite3Int64;
+	pub fn sqlite3_release_memory(amount: c_int) -> c_int;
 	pub fn sqlite3_stmt_readonly(p_stmt: *mut Sqlite3Stmt) -> c_int;
 	pub fn sqlite3_stmt_isexplain(p_stmt: *mut Sqlite3Stmt) -> c_int;
 	pub fn sqlite3_stmt_status(p_stmt: *mut Sqlite3Stmt, op: c_int, reset: c_int) -> c_int;
+	pub fn sqlite3_stmt_busy(p_stmt: *mut Sqlite3Stmt) -> c_int;
+	pub fn sqlite3_serialize(
+		db: *mut Sqlite3,
+		z_schema: *const c_char,
+		pi_size: *mut Sqlite3Int64,
+		m_flags: c_uint,
+	) -> *mut c_uchar;
+	pub fn sqlite3_deserialize(
+		db: *mut Sqlite3,
+		z_schema: *const c_char,
+		p_data: *mut c_uchar,
+		sz_db: Sqlite3Int64,
+		sz_buf: Sqlite3Int64,
+		m_flags: c_uint,
+	) -> c_int;
 }

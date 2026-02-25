@@ -19,8 +19,11 @@ pub(crate) struct Cursor {
 	pub(crate) bindings_names: Vec<Option<String>>,
 	pub(crate) executemany_pending: bool,
 	pub(crate) collecting_executemany: bool,
-	pub(crate) executemany_results: Vec<Py<PyAny>>,
-	pub(crate) executemany_result_index: usize,
+	pub(crate) executemany_bindings: Vec<Py<PyAny>>,
+	pub(crate) executemany_bindings_index: usize,
+	pub(crate) executemany_sql: Option<String>,
+	pub(crate) executemany_prepare_flags: u32,
+	pub(crate) executemany_explain: i32,
 	pub(crate) last_short_description: Option<Py<PyTuple>>,
 	pub(crate) last_full_description: Option<Py<PyTuple>>,
 	pub(crate) last_description_full: Option<Py<PyTuple>>,
@@ -29,8 +32,13 @@ pub(crate) struct Cursor {
 	pub(crate) trace_is_readonly: bool,
 	pub(crate) trace_expanded_sql: String,
 	pub(crate) skip_exec_trace_once: bool,
+	pub(crate) profile_start: Option<std::time::Instant>,
 	pub(crate) execute_explain: i32,
 	pub(crate) virtual_module_counter: usize,
+	pub(crate) pending_fetch_error: Option<PyErr>,
+	pub(crate) step_after_row_pending: bool,
+	pub(crate) callback_depth: usize,
+	pub(crate) init_called: bool,
 }
 
 unsafe impl Send for Cursor {}
@@ -132,6 +140,10 @@ impl ExecTraceCursorProxy {
 }
 
 impl Cursor {
+	fn sql_has_remaining_statements(sql: &str) -> bool {
+		sql.chars().any(|ch| !ch.is_ascii_whitespace() && ch != ';')
+	}
+
 	fn is_simple_double_quoted_select(sql: &str) -> bool {
 		let compact = sql.trim().trim_end_matches(';').trim();
 		if !compact.starts_with("select \"") {
@@ -483,6 +495,46 @@ impl Cursor {
 				return Err(SQLError::new_err(format!("no such module: {module_name}")));
 			}
 			if let Some(source) = module_source {
+				if let Ok(create) = source.bind(py).getattr("Create") {
+					let connection = self.connection.clone_ref(py);
+					let create_result =
+						match create.call1((connection.clone_ref(py), module_name, "main", table_name)) {
+							Ok(value) => value,
+							Err(_) => create.call0()?,
+						};
+					if let Ok(tuple) = create_result.cast::<PyTuple>() {
+						if !tuple.is_empty() {
+							if let Ok(schema) = tuple.get_item(0)?.extract::<String>() {
+								let db = self.connection_db(py)?;
+								let schema_c = CString::new(schema).map_err(|_| {
+									pyo3::exceptions::PyValueError::new_err("schema contains NUL byte")
+								})?;
+								let mut stmt = null_mut();
+								let mut tail = null();
+								let rc = unsafe {
+									arsw::ffi::sqlite3_prepare_v3(
+										db,
+										schema_c.as_ptr(),
+										-1,
+										0,
+										&raw mut stmt,
+										&raw mut tail,
+									)
+								};
+								let _ = tail;
+								if !stmt.is_null() {
+									unsafe {
+										arsw::ffi::sqlite3_finalize(stmt);
+									}
+								}
+								if rc != SQLITE_OK {
+									return Err(sqlite_error_for_code(py, db, sqlite_effective_error_code(db, rc)));
+								}
+							}
+						}
+					}
+				}
+
 				let after_name = after_using[module_name.len()..].trim();
 				if after_name.starts_with('(') {
 					if let Some(close) = find_matching_paren(after_name, 0) {
@@ -609,8 +661,11 @@ impl Cursor {
 			bindings_names: Vec::new(),
 			executemany_pending: false,
 			collecting_executemany: false,
-			executemany_results: Vec::new(),
-			executemany_result_index: 0,
+			executemany_bindings: Vec::new(),
+			executemany_bindings_index: 0,
+			executemany_sql: None,
+			executemany_prepare_flags: 0,
+			executemany_explain: -1,
 			last_short_description: None,
 			last_full_description: None,
 			last_description_full: None,
@@ -619,8 +674,13 @@ impl Cursor {
 			trace_is_readonly: false,
 			trace_expanded_sql: String::new(),
 			skip_exec_trace_once: false,
+			profile_start: None,
 			execute_explain: -1,
 			virtual_module_counter: 0,
+			pending_fetch_error: None,
+			step_after_row_pending: false,
+			callback_depth: 0,
+			init_called: false,
 		}
 	}
 
@@ -633,6 +693,10 @@ impl Cursor {
 		}
 		self.have_row = false;
 		self.active_statement_thread = None;
+		self.profile_start = None;
+		self.pending_fetch_error = None;
+		self.step_after_row_pending = false;
+		self.callback_depth = 0;
 		self.bindings_count = 0;
 		self.bindings_names.clear();
 	}
@@ -643,10 +707,13 @@ impl Cursor {
 		self.prepare_flags = 0;
 		self.bindings_source = BindingsSource::None;
 		self.bindings_index = 0;
-		self.executemany_pending = false;
 		if !self.collecting_executemany {
-			self.executemany_results.clear();
-			self.executemany_result_index = 0;
+			self.executemany_pending = false;
+			self.executemany_bindings.clear();
+			self.executemany_bindings_index = 0;
+			self.executemany_sql = None;
+			self.executemany_prepare_flags = 0;
+			self.executemany_explain = -1;
 		}
 		self.last_short_description = None;
 		self.last_full_description = None;
@@ -656,17 +723,21 @@ impl Cursor {
 	}
 
 	fn has_pending_work(&self) -> bool {
-		let has_pending_sql = self.pending_sql.as_ref().is_some_and(|sql| !sql.trim().is_empty());
+		let has_pending_sql =
+			self.pending_sql.as_ref().is_some_and(|sql| Self::sql_has_remaining_statements(sql));
 		let has_pending_executemany_bindings = match &self.bindings_source {
 			BindingsSource::Positional(values) => self.bindings_index < values.len(),
 			_ => false,
 		};
 
-		has_pending_sql || has_pending_executemany_bindings || self.executemany_pending
+		has_pending_sql
+			|| has_pending_executemany_bindings
+			|| (self.executemany_pending && !self.collecting_executemany)
 	}
 
 	fn has_active_statement(&self) -> bool {
-		!self.stmt.is_null() || self.pending_sql.as_ref().is_some_and(|sql| !sql.trim().is_empty())
+		!self.stmt.is_null()
+			|| self.pending_sql.as_ref().is_some_and(|sql| Self::sql_has_remaining_statements(sql))
 	}
 
 	fn update_active_statement_thread(&mut self) {
@@ -701,12 +772,14 @@ impl Cursor {
 
 	fn effective_row_trace(&self, py: Python<'_>) -> Option<Py<PyAny>> {
 		if let Some(trace) = &self.row_trace {
-			if trace.bind(py).is_none() {
-				return None;
-			}
-			return Some(trace.clone_ref(py));
+			return resolve_callable(py, trace).ok().flatten();
 		}
-		self.connection.borrow(py).row_trace.as_ref().map(|trace| trace.clone_ref(py))
+		self
+			.connection
+			.borrow(py)
+			.row_trace
+			.as_ref()
+			.and_then(|trace| resolve_callable(py, trace).ok().flatten())
 	}
 
 	fn effective_convert_binding(&self, py: Python<'_>) -> Option<Py<PyAny>> {
@@ -729,36 +802,62 @@ impl Cursor {
 		self.connection.borrow(py).convert_jsonb.as_ref().map(|value| value.clone_ref(py))
 	}
 
-	fn apply_convert_binding(
+	fn bind_value_with_convert_binding(
 		&self,
 		py: Python<'_>,
+		db: *mut arsw::ffi::Sqlite3,
+		stmt: *mut arsw::ffi::Sqlite3Stmt,
 		sqlite_index: c_int,
 		value: &Bound<'_, PyAny>,
-	) -> PyResult<Py<PyAny>> {
-		let Some(convert_binding) = self.effective_convert_binding(py) else {
-			return Ok(value.clone().unbind());
-		};
-		let cursor_proxy = self.make_convert_cursor_proxy(py, false)?;
-
-		let converted = convert_binding.bind(py).call1((cursor_proxy, sqlite_index, value))?;
-		Ok(converted.unbind())
+	) -> PyResult<()> {
+		self.check_limit_length(py, value)?;
+		match bind_value(py, db, stmt, sqlite_index, value) {
+			Ok(()) => Ok(()),
+			Err(err) => {
+				if !err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+					return Err(err);
+				}
+				let Some(convert_binding) = self.effective_convert_binding(py) else {
+					return Err(err);
+				};
+				let cursor_proxy = self.make_convert_cursor_proxy(py, false)?;
+				let converted = convert_binding.bind(py).call1((cursor_proxy, sqlite_index, value))?;
+				self.check_limit_length(py, &converted)?;
+				bind_value(py, db, stmt, sqlite_index, &converted)
+			}
+		}
 	}
 
-	fn run_progress_handler(&self, py: Python<'_>) -> PyResult<()> {
-		let mut connection = self.connection.borrow_mut(py);
-		let Some(handler) = connection.progress_handler.as_ref().map(|value| value.clone_ref(py))
-		else {
+	fn check_limit_length(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+		let Some(limit_key) = sqlite_constant_value("SQLITE_LIMIT_LENGTH") else {
 			return Ok(());
 		};
+		let limit = self.connection.borrow(py).limits.get(&limit_key).copied().unwrap_or(i32::MAX);
+		if limit < 0 {
+			return Ok(());
+		}
+		let limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
-		connection.progress_counter = connection.progress_counter.saturating_add(1);
-		if connection.progress_nsteps > 0
-			&& connection.progress_counter.is_multiple_of(connection.progress_nsteps)
-		{
-			let should_abort = handler.bind(py).call0()?.is_truthy()?;
-			if should_abort {
-				return Err(InterruptError::new_err("Operation interrupted by progress handler"));
-			}
+		let value_len = if let Ok(text) = value.extract::<String>() {
+			Some(text.len())
+		} else if let Ok(bytes) = value.cast::<PyBytes>() {
+			Some(bytes.as_bytes().len())
+		} else if let Ok(bytes) = value.cast::<PyByteArray>() {
+			Some(unsafe { bytes.as_bytes() }.len())
+		} else if let Ok(zero_blob) = value.cast::<ZeroBlob>() {
+			Some(zero_blob.borrow().length)
+		} else if {
+			let memoryview_type = PyModule::import(py, "builtins")?.getattr("memoryview")?;
+			value.is_instance(&memoryview_type)?
+		} {
+			let nbytes = value.getattr("nbytes")?.extract::<usize>()?;
+			Some(nbytes)
+		} else {
+			None
+		};
+
+		if value_len.is_some_and(|len| len > limit) {
+			return Err(TooBigError::new_err("string or blob too big"));
 		}
 
 		Ok(())
@@ -1001,11 +1100,53 @@ impl Cursor {
 			},
 		)?
 		.into_any();
-		let proceed = trace.bind(py).call1((callback_cursor, sql, bindings))?.is_truthy()?;
+		let returned = trace.bind(py).call1((callback_cursor, sql, bindings)).map_err(|err| {
+			Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+			err
+		})?;
+		if returned.is_instance_of::<pyo3::types::PyComplex>() {
+			let returned_repr = returned
+				.repr()
+				.map(|text| text.to_string_lossy().to_string())
+				.unwrap_or_else(|_| "<unrepresentable>".to_string());
+			let err = pyo3::exceptions::PyTypeError::new_err("Expected a bool, not complex");
+			Self::augment_trace_error(
+				py,
+				&err,
+				"APSWCursor_do_exec_trace",
+				Some((&"returned", returned_repr)),
+			);
+			return Err(err);
+		}
+		let proceed = returned.is_truthy().map_err(|err| {
+			Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+			err
+		})?;
 		if !proceed {
 			return Err(ExecTraceAbort::new_err("Execution aborted by exec trace"));
 		}
 		Ok(())
+	}
+
+	fn augment_trace_error(
+		py: Python<'_>,
+		err: &PyErr,
+		frame_name: &str,
+		detail: Option<(&str, String)>,
+	) {
+		let value = err.value(py);
+		let base = value
+			.str()
+			.map(|text| text.to_string_lossy().to_string())
+			.unwrap_or_else(|_| "callback error".to_string());
+		let mut message = format!("{base}\n, in {frame_name}");
+		if let Some((name, value)) = detail {
+			message.push_str("\n    ");
+			message.push_str(name);
+			message.push_str(" = ");
+			message.push_str(value.as_str());
+		}
+		let _ = value.setattr("args", (message,));
 	}
 
 	fn run_exec_trace_callback(
@@ -1170,6 +1311,16 @@ impl Cursor {
 			} else {
 				connection.last_changes = 0;
 			}
+			if text.starts_with("create") {
+				connection.schema_reset_vacuumed = false;
+			}
+			if text.starts_with("vacuum") {
+				if let Some(op) = sqlite_constant_value("SQLITE_DBCONFIG_RESET_DATABASE") {
+					if connection.db_config.get(&op).copied().unwrap_or(0) != 0 {
+						connection.schema_reset_vacuumed = true;
+					}
+				}
+			}
 			(
 				connection.update_hook.as_ref().map(|value| value.clone_ref(py)),
 				connection.autovacuum_pages.as_ref().map(|value| value.clone_ref(py)),
@@ -1231,6 +1382,21 @@ impl Cursor {
 
 	fn run_transaction_hooks_for_sql(&self, py: Python<'_>, sql: &str) -> PyResult<()> {
 		let text = sql.trim_start().to_ascii_lowercase();
+		let call_hooks_with_chain = |hooks: Vec<Py<PyAny>>| -> PyResult<()> {
+			let mut chained: Option<PyErr> = None;
+			for hook in hooks {
+				if let Err(err) = hook.bind(py).call0() {
+					if let Some(previous) = chained.take() {
+						err.value(py).setattr("__context__", previous.value(py))?;
+					}
+					chained = Some(err);
+				}
+			}
+			if let Some(err) = chained {
+				return Err(err);
+			}
+			Ok(())
+		};
 		let (commit_hook, commit_hook_ids, rollback_hook, rollback_hook_ids, wal_hook) = {
 			let mut connection = self.connection.borrow_mut(py);
 			if text.starts_with("begin") {
@@ -1284,12 +1450,13 @@ impl Cursor {
 				let _: c_int = result.extract()?;
 			}
 		} else if text.starts_with("rollback") {
+			let mut hooks =
+				Vec::with_capacity(rollback_hook_ids.len() + usize::from(rollback_hook.is_some()));
 			if let Some(rollback_hook) = rollback_hook {
-				rollback_hook.bind(py).call0()?;
+				hooks.push(rollback_hook);
 			}
-			for rollback_hook in &rollback_hook_ids {
-				rollback_hook.bind(py).call0()?;
-			}
+			hooks.extend(rollback_hook_ids);
+			call_hooks_with_chain(hooks)?;
 		}
 
 		Ok(())
@@ -1365,6 +1532,20 @@ impl Cursor {
 		Ok(())
 	}
 
+	fn run_profile_for_sql(&mut self, py: Python<'_>, sql: &str) -> PyResult<()> {
+		let elapsed_ns = self
+			.profile_start
+			.take()
+			.map(|started| started.elapsed().as_nanos())
+			.unwrap_or(0_u128)
+			.min(i64::MAX as u128) as i64;
+		let callback = self.connection.borrow(py).profile.as_ref().map(|value| value.clone_ref(py));
+		if let Some(callback) = callback {
+			callback.bind(py).call1((sql, elapsed_ns))?;
+		}
+		Ok(())
+	}
+
 	fn set_bindings_source(&mut self, bindings: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
 		self.bindings_index = 0;
 		self.bindings_source = match bindings {
@@ -1374,8 +1555,8 @@ impl Cursor {
 				let null_bindings = apsw_module.getattr("_null_bindings")?;
 				if bindings.is(&null_bindings) {
 					BindingsSource::Null
-				} else if let Ok(mapping) = bindings.cast::<PyDict>() {
-					BindingsSource::Named(mapping.clone().unbind())
+				} else if self.is_mapping_binding(bindings)? {
+					BindingsSource::Named(bindings.clone().unbind())
 				} else {
 					if bindings.cast::<PyBytes>().is_ok() || bindings.cast::<PyByteArray>().is_ok() {
 						return Err(pyo3::exceptions::PyTypeError::new_err(
@@ -1407,6 +1588,16 @@ impl Cursor {
 		Ok(())
 	}
 
+	fn is_mapping_binding(&self, binding: &Bound<'_, PyAny>) -> PyResult<bool> {
+		if binding.cast::<PyDict>().is_ok() {
+			return Ok(true);
+		}
+
+		let collections_abc = PyModule::import(binding.py(), "collections.abc")?;
+		let mapping = collections_abc.getattr("Mapping")?;
+		binding.is_instance(&mapping)
+	}
+
 	fn handle_busy_condition(
 		&self,
 		py: Python<'_>,
@@ -1422,6 +1613,9 @@ impl Cursor {
 		};
 
 		if let Some(busy_handler) = busy_handler {
+			let Some(busy_handler) = resolve_callable(py, &busy_handler)? else {
+				return Err(sqlite_error_for_code(py, db, rc));
+			};
 			for attempt in 0_i32..1024 {
 				let retry = busy_handler.bind(py).call1((attempt,))?.is_truthy()?;
 				if !retry {
@@ -1429,7 +1623,7 @@ impl Cursor {
 				}
 			}
 		} else if busy_timeout_ms > 0 {
-			std::thread::sleep(Duration::from_millis(u64::try_from(busy_timeout_ms).unwrap_or(0)));
+			let _ = busy_timeout_ms;
 		}
 
 		Err(sqlite_error_for_code(py, db, rc))
@@ -1469,7 +1663,7 @@ impl Cursor {
 	) -> PyResult<()> {
 		let _ = take_callback_error();
 		self.connection_db(py)?;
-		if self.executemany_pending {
+		if self.executemany_pending && !self.collecting_executemany {
 			self.reset_execution_state();
 			self.update_active_statement_thread();
 			return Err(incomplete_executemany_error());
@@ -1523,7 +1717,9 @@ impl Cursor {
 			let current_sql = self.prepared_statement_sql();
 			self.run_implicit_commit_hooks_for_sql(py, &current_sql)?;
 
-			self.run_progress_handler(py)?;
+			if self.profile_start.is_none() {
+				self.profile_start = Some(std::time::Instant::now());
+			}
 			let rc = fault_injected_sqlite_call!(
 				py,
 				"sqlite3_step",
@@ -1544,8 +1740,21 @@ impl Cursor {
 				}
 				SQLITE_DONE => {
 					let sql = self.prepared_statement_sql();
-					self.run_transaction_hooks_for_sql(py, &sql)?;
-					self.run_update_hook_for_sql(py, &sql)?;
+					if let Err(err) = self.run_profile_for_sql(py, &sql) {
+						self.reset_execution_state();
+						self.update_active_statement_thread();
+						return Err(err);
+					}
+					if let Err(err) = self.run_transaction_hooks_for_sql(py, &sql) {
+						self.reset_execution_state();
+						self.update_active_statement_thread();
+						return Err(err);
+					}
+					if let Err(err) = self.run_update_hook_for_sql(py, &sql) {
+						self.reset_execution_state();
+						self.update_active_statement_thread();
+						return Err(err);
+					}
 					self.finalize_statement();
 					self.update_active_statement_thread();
 				}
@@ -1578,7 +1787,7 @@ impl Cursor {
 				return Ok(false);
 			};
 
-			if sql.trim().is_empty() {
+			if !Self::sql_has_remaining_statements(sql.as_str()) {
 				return Ok(false);
 			}
 
@@ -1605,25 +1814,30 @@ impl Cursor {
 			let sql_c = CString::new(sql)
 				.map_err(|_| pyo3::exceptions::PyValueError::new_err("SQL statements contain NUL byte"))?;
 
-			let mut stmt = null_mut();
-			let mut tail = null();
+			let mut stmt: *mut arsw::ffi::Sqlite3Stmt = null_mut();
+			let mut tail: *const c_char = null();
 			let mut attempted_collation_needed = false;
 			let rc = loop {
+				let db_ptr = db as usize;
+				let sql_ptr = sql_c.as_ptr() as usize;
+				let prepare_flags = self.prepare_flags;
+				let stmt_addr = (&raw mut stmt) as usize;
+				let tail_addr = (&raw mut tail) as usize;
 				let rc = fault_injected_sqlite_call!(
 					py,
 					"sqlite3_prepare_v3",
 					"cursor_prepare_next_statement",
 					"db, sql, -1, prepare_flags, out stmt, out tail",
-					unsafe {
+					py.detach(move || unsafe {
 						arsw::ffi::sqlite3_prepare_v3(
-							db,
-							sql_c.as_ptr(),
+							db_ptr as *mut arsw::ffi::Sqlite3,
+							sql_ptr as *const c_char,
 							-1,
-							self.prepare_flags,
-							&raw mut stmt,
-							&raw mut tail,
+							prepare_flags,
+							stmt_addr as *mut *mut arsw::ffi::Sqlite3Stmt,
+							tail_addr as *mut *const c_char,
 						)
-					}
+					})
 				);
 				if rc == SQLITE_OK {
 					break rc;
@@ -1703,7 +1917,8 @@ impl Cursor {
 					)));
 				}
 
-				let has_more_sql = self.pending_sql.as_ref().is_some_and(|sql| !sql.trim().is_empty());
+				let has_more_sql =
+					self.pending_sql.as_ref().is_some_and(|sql| Self::sql_has_remaining_statements(sql));
 				if !has_more_sql && count != remaining {
 					return Err(BindingsError::new_err(format!(
 						"Incorrect number of bindings supplied.  The current statement uses {count} and there are {remaining} supplied."
@@ -1714,8 +1929,7 @@ impl Cursor {
 					let sqlite_index = c_int::try_from(offset + 1).expect("binding index fits in c_int");
 					let value =
 						values.get(self.bindings_index + offset).expect("binding index is in range").bind(py);
-					let converted = self.apply_convert_binding(py, sqlite_index, value)?;
-					bind_value(py, db, self.stmt, sqlite_index, converted.bind(py))?;
+					self.bind_value_with_convert_binding(py, db, self.stmt, sqlite_index, value)?;
 				}
 				self.bindings_index += count;
 			}
@@ -1733,21 +1947,24 @@ impl Cursor {
 					let raw_name = unsafe { CStr::from_ptr(raw_name).to_string_lossy().into_owned() };
 					let trimmed = raw_name.trim_start_matches(['?', ':', '@', '$']);
 
-					let value = mapping
-						.get_item(trimmed)?
-						.or_else(|| mapping.get_item(raw_name.as_str()).ok().flatten());
-					let value = if let Some(value) = value {
-						value
-					} else if ALLOW_MISSING_DICT_BINDINGS.load(Ordering::Relaxed) {
-						py.None().into_bound(py)
-					} else {
-						return Err(BindingsError::new_err(format!(
-							"No such named binding parameter: {trimmed}"
-						)));
+					let value = mapping.get_item(trimmed).or_else(|_| mapping.get_item(raw_name.as_str()));
+					let value = match value {
+						Ok(value) => value,
+						Err(err) => {
+							if !err.is_instance_of::<pyo3::exceptions::PyKeyError>(py)
+								&& !err.is_instance_of::<pyo3::exceptions::PyIndexError>(py)
+							{
+								return Err(err);
+							}
+							if ALLOW_MISSING_DICT_BINDINGS.load(Ordering::Relaxed) {
+								py.None().into_bound(py)
+							} else {
+								return Err(pyo3::exceptions::PyKeyError::new_err(trimmed.to_string()));
+							}
+						}
 					};
 
-					let converted = self.apply_convert_binding(py, sqlite_index, &value)?;
-					bind_value(py, db, self.stmt, sqlite_index, converted.bind(py))?;
+					self.bind_value_with_convert_binding(py, db, self.stmt, sqlite_index, &value)?;
 				}
 			}
 		}
@@ -1767,6 +1984,17 @@ impl Cursor {
 		}
 
 		Ok(())
+	}
+
+	fn statements_likely_return_rows(&self, statements: &str) -> bool {
+		statements.split(';').any(|statement| {
+			let lowered = statement.trim_start().to_ascii_lowercase();
+			lowered.starts_with("select")
+				|| lowered.starts_with("with")
+				|| lowered.starts_with("pragma")
+				|| lowered.starts_with("explain")
+				|| lowered.starts_with("values")
+		})
 	}
 
 	fn read_current_row(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
@@ -1913,14 +2141,13 @@ impl Cursor {
 		}
 
 		let db = self.connection_db(py)?;
-		self.run_progress_handler(py)?;
-		let rc = fault_injected_sqlite_call!(
-			py,
-			"sqlite3_step",
-			"cursor_step_after_row",
-			"self.stmt",
-			unsafe { arsw::ffi::sqlite3_step(self.stmt) }
-		);
+		if self.profile_start.is_none() {
+			self.profile_start = Some(std::time::Instant::now());
+		}
+		let rc =
+			fault_injected_sqlite_call!(py, "sqlite3_step", "cursor_step_after_row", "self.stmt", {
+				unsafe { arsw::ffi::sqlite3_step(self.stmt) }
+			});
 		if let Some(err) = take_callback_error() {
 			self.reset_execution_state();
 			return Err(err);
@@ -1932,10 +2159,30 @@ impl Cursor {
 			}
 			SQLITE_DONE => {
 				let sql = self.prepared_statement_sql();
-				self.run_transaction_hooks_for_sql(py, &sql)?;
-				self.run_update_hook_for_sql(py, &sql)?;
-				self.finalize_statement();
-				if self.pending_sql.as_ref().is_none_or(|sql| sql.trim().is_empty()) {
+				if let Err(err) = self.run_profile_for_sql(py, &sql) {
+					self.reset_execution_state();
+					return Err(err);
+				}
+				if let Err(err) = self.run_transaction_hooks_for_sql(py, &sql) {
+					self.reset_execution_state();
+					return Err(err);
+				}
+				if let Err(err) = self.run_update_hook_for_sql(py, &sql) {
+					self.reset_execution_state();
+					return Err(err);
+				}
+				let has_remaining_sql =
+					self.pending_sql.as_ref().is_some_and(|sql| Self::sql_has_remaining_statements(sql));
+				if has_remaining_sql || self.executemany_pending {
+					self.finalize_statement();
+				} else {
+					self.have_row = false;
+					self.active_statement_thread = None;
+					self.profile_start = None;
+					self.bindings_count = 0;
+					self.bindings_names.clear();
+				}
+				if !has_remaining_sql {
 					if let Err(err) = self.ensure_all_bindings_consumed() {
 						self.bindings_source = BindingsSource::None;
 						self.bindings_index = 0;
@@ -1977,14 +2224,18 @@ impl Cursor {
 		Self::new(connection)
 	}
 
-	#[pyo3(signature = (_connection, *args, **kwargs))]
+	#[pyo3(signature = (*args, **kwargs))]
 	fn __init__(
 		&mut self,
-		_connection: Py<Connection>,
 		args: &Bound<'_, PyTuple>,
 		kwargs: Option<&Bound<'_, PyDict>>,
-	) {
+	) -> PyResult<()> {
 		let _ = (args, kwargs);
+		if self.init_called {
+			return Err(repeated_init_error());
+		}
+		self.init_called = true;
+		Ok(())
 	}
 
 	fn __iter__(slf: PyRef<'_, Self>) -> Py<Self> {
@@ -1995,8 +2246,22 @@ impl Cursor {
 		!self.closed
 	}
 
-	fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-		self.fetchone(py)
+	fn __next__(slf: Py<Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+		let mut cursor = slf
+			.bind(py)
+			.try_borrow_mut()
+			.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+		if cursor.callback_depth > 0 {
+			return Err(ThreadingViolationError::new_err("Cursor is being used recursively"));
+		}
+		let row = cursor.fetchone_impl(py)?;
+		if row.is_some() && cursor.step_after_row_pending {
+			cursor.step_after_row_pending = false;
+			if let Err(err) = cursor.step_after_row(py) {
+				cursor.pending_fetch_error = Some(err);
+			}
+		}
+		Ok(row)
 	}
 
 	#[getter(exec_trace)]
@@ -2062,7 +2327,7 @@ impl Cursor {
 			if !value.is_callable() {
 				return Err(pyo3::exceptions::PyTypeError::new_err("Expected a callable"));
 			}
-			self.row_trace = Some(value.clone().unbind());
+			self.row_trace = Some(maybe_weak_method_callable(py, value)?);
 		} else {
 			self.row_trace = Some(py.None());
 		}
@@ -2193,7 +2458,10 @@ impl Cursor {
 	#[getter]
 	fn has_vdbe(&self, py: Python<'_>) -> PyResult<bool> {
 		self.connection_db(py)?;
-		Ok(!self.stmt.is_null())
+		if self.stmt.is_null() {
+			return Ok(self.trace_has_vdbe);
+		}
+		Ok(true)
 	}
 
 	#[getter(description)]
@@ -2267,23 +2535,30 @@ impl Cursor {
 	}
 
 	#[pyo3(signature = (force = false))]
-	fn close(&mut self, force: bool) -> PyResult<()> {
-		if self.closed {
+	fn close(slf: Py<Self>, py: Python<'_>, force: bool) -> PyResult<()> {
+		let mut cursor = slf
+			.bind(py)
+			.try_borrow_mut()
+			.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+		if cursor.callback_depth > 0 {
+			return Err(ThreadingViolationError::new_err("Cursor is being used recursively"));
+		}
+		if cursor.closed {
 			return Ok(());
 		}
 
-		if self.has_pending_work() && !force {
+		if cursor.has_pending_work() && !force {
 			return Err(incomplete_execution_error());
 		}
 
-		self.reset_execution_state();
-		self.closed = true;
+		cursor.reset_execution_state();
+		cursor.closed = true;
 		Ok(())
 	}
 
 	#[pyo3(signature = (statements, bindings = None, *, can_cache = true, prepare_flags = 0, explain = -1))]
 	fn execute(
-		mut slf: PyRefMut<'_, Self>,
+		slf: Py<Self>,
 		py: Python<'_>,
 		statements: &str,
 		bindings: Option<&Bound<'_, PyAny>>,
@@ -2292,23 +2567,78 @@ impl Cursor {
 		explain: i32,
 	) -> PyResult<Py<Self>> {
 		let _ = can_cache;
-		let cursor_obj: Py<Self> = slf.into();
+		let cursor_obj: Py<Self> = slf;
 		let cursor_bound = cursor_obj.bind(py);
 		let trace_call = {
-			let mut cursor = cursor_bound.borrow_mut();
+			let mut cursor = cursor_bound
+				.try_borrow_mut()
+				.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+			if cursor.callback_depth > 0 {
+				return Err(ThreadingViolationError::new_err("Cursor is being used recursively"));
+			}
 			cursor.run_exec_trace_callback(py, statements, bindings, prepare_flags, explain)?
 		};
 		if let Some((trace, sql, bindings_obj)) = trace_call {
-			let proceed =
-				trace.bind(py).call1((cursor_bound.clone(), sql.as_str(), bindings_obj))?.is_truthy()?;
+			{
+				let mut cursor = cursor_bound
+					.try_borrow_mut()
+					.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+				cursor.callback_depth += 1;
+			}
+			let returned = match trace.bind(py).call1((cursor_bound.clone(), sql.as_str(), bindings_obj))
+			{
+				Ok(value) => value,
+				Err(err) => {
+					Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+					{
+						let mut cursor = cursor_bound
+							.try_borrow_mut()
+							.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+						cursor.callback_depth = cursor.callback_depth.saturating_sub(1);
+					}
+					return Err(err);
+				}
+			};
+			{
+				let mut cursor = cursor_bound
+					.try_borrow_mut()
+					.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+				cursor.callback_depth = cursor.callback_depth.saturating_sub(1);
+			}
+			if returned.is_instance_of::<pyo3::types::PyComplex>() {
+				let returned_repr = returned
+					.repr()
+					.map(|text| text.to_string_lossy().to_string())
+					.unwrap_or_else(|_| "<unrepresentable>".to_string());
+				let err = pyo3::exceptions::PyTypeError::new_err("Expected a bool, not complex");
+				Self::augment_trace_error(
+					py,
+					&err,
+					"APSWCursor_do_exec_trace",
+					Some((&"returned", returned_repr)),
+				);
+				return Err(err);
+			}
+			let proceed = returned.is_truthy().map_err(|err| {
+				Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+				err
+			})?;
 			if !proceed {
-				cursor_bound.borrow().run_authorizer_for_sql(py, &sql)?;
+				cursor_bound
+					.try_borrow()
+					.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?
+					.run_authorizer_for_sql(py, &sql)?;
 				return Err(ExecTraceAbort::new_err("Execution aborted by exec trace"));
 			}
-			cursor_bound.borrow_mut().skip_exec_trace_once = true;
+			cursor_bound
+				.try_borrow_mut()
+				.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?
+				.skip_exec_trace_once = true;
 		}
 		{
-			let mut cursor = cursor_bound.borrow_mut();
+			let mut cursor = cursor_bound
+				.try_borrow_mut()
+				.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
 			cursor.execute_impl(py, statements, bindings, prepare_flags, explain)?;
 		}
 		Ok(cursor_obj)
@@ -2316,7 +2646,7 @@ impl Cursor {
 
 	#[pyo3(signature = (statements, sequenceofbindings, *, can_cache = true, prepare_flags = 0, explain = -1))]
 	fn executemany(
-		mut slf: PyRefMut<'_, Self>,
+		slf: Py<Self>,
 		py: Python<'_>,
 		statements: &str,
 		sequenceofbindings: &Bound<'_, PyAny>,
@@ -2325,91 +2655,222 @@ impl Cursor {
 		explain: i32,
 	) -> PyResult<Py<Self>> {
 		let _ = can_cache;
-		if slf.executemany_pending {
-			slf.reset_execution_state();
+		let cursor_obj: Py<Self> = slf;
+		let cursor_bound = cursor_obj.bind(py);
+		let mut cursor = cursor_bound
+			.try_borrow_mut()
+			.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+		if cursor.callback_depth > 0 {
+			return Err(ThreadingViolationError::new_err("Cursor is being used recursively"));
+		}
+		if cursor.executemany_pending {
+			cursor.reset_execution_state();
 			return Err(incomplete_executemany_error());
 		}
-		if slf.has_pending_work() {
-			slf.reset_execution_state();
+		if cursor.has_pending_work() {
+			cursor.reset_execution_state();
 			return Err(incomplete_execution_error());
 		}
-		let cursor_obj: Py<Self> = slf.into();
-		let cursor_bound = cursor_obj.bind(py);
-		{
-			let mut cursor = cursor_bound.borrow_mut();
-			cursor.collecting_executemany = true;
-			cursor.executemany_results.clear();
-			cursor.executemany_result_index = 0;
-		}
-		let result: PyResult<()> = (|| {
+		if cursor.statements_likely_return_rows(statements) {
+			let mut bindings = Vec::new();
 			for each in sequenceofbindings.try_iter()? {
 				let binding = each?;
-				let trace_call = {
-					let mut cursor = cursor_bound.borrow_mut();
-					cursor.run_exec_trace_callback(py, statements, Some(&binding), prepare_flags, explain)?
-				};
-				if let Some((trace, sql, bindings_obj)) = trace_call {
-					let proceed = trace
-						.bind(py)
-						.call1((cursor_bound.clone(), sql.as_str(), bindings_obj))?
-						.is_truthy()?;
-					if !proceed {
-						cursor_bound.borrow().run_authorizer_for_sql(py, &sql)?;
-						return Err(ExecTraceAbort::new_err("Execution aborted by exec trace"));
-					}
-					cursor_bound.borrow_mut().skip_exec_trace_once = true;
+				let valid = cursor.is_mapping_binding(&binding)?
+					|| binding.cast::<PySequence>().is_ok()
+					|| binding.try_iter().is_ok();
+				if !valid {
+					return Err(pyo3::exceptions::PyTypeError::new_err(
+						"You must supply a dict or a sequence for each row",
+					));
 				}
-				let mut cursor = cursor_bound.borrow_mut();
-				cursor.execute_impl(py, statements, Some(&binding), prepare_flags, explain)?;
-				while let Some(row) = cursor.fetchone(py)? {
-					cursor.executemany_results.push(row);
-				}
+				bindings.push(binding.unbind());
 			}
-			Ok(())
-		})();
-		{
-			let mut cursor = cursor_bound.borrow_mut();
-			cursor.collecting_executemany = false;
-			if result.is_ok() && !cursor.executemany_results.is_empty() {
-				cursor.executemany_pending = true;
-				cursor.executemany_result_index = 0;
-			} else if result.is_err() {
+			if bindings.is_empty() {
 				cursor.executemany_pending = false;
-				cursor.executemany_results.clear();
-				cursor.executemany_result_index = 0;
+				cursor.executemany_bindings.clear();
+				cursor.executemany_bindings_index = 0;
+				cursor.executemany_sql = None;
+				cursor.executemany_prepare_flags = 0;
+				cursor.executemany_explain = -1;
+				return Ok(cursor_obj);
 			}
+
+			let first_binding = bindings.first().expect("bindings is not empty").bind(py);
+			cursor.set_bindings_source(Some(&first_binding))?;
+			cursor.bindings_source = BindingsSource::None;
+			cursor.bindings_index = 0;
+
+			let trace_call = cursor.run_exec_trace_callback(
+				py,
+				statements,
+				Some(&first_binding),
+				prepare_flags,
+				explain,
+			)?;
+			if let Some((trace, sql, bindings_obj)) = trace_call {
+				drop(cursor);
+				let returned = trace
+					.bind(py)
+					.call1((cursor_bound.clone(), sql.as_str(), bindings_obj))
+					.map_err(|err| {
+						Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+						err
+					})?;
+				if returned.is_instance_of::<pyo3::types::PyComplex>() {
+					let returned_repr = returned
+						.repr()
+						.map(|text| text.to_string_lossy().to_string())
+						.unwrap_or_else(|_| "<unrepresentable>".to_string());
+					let err = pyo3::exceptions::PyTypeError::new_err("Expected a bool, not complex");
+					Self::augment_trace_error(
+						py,
+						&err,
+						"APSWCursor_do_exec_trace",
+						Some((&"returned", returned_repr)),
+					);
+					return Err(err);
+				}
+				let proceed = returned.is_truthy().map_err(|err| {
+					Self::augment_trace_error(py, &err, "APSWCursor_do_exec_trace", None);
+					err
+				})?;
+				if !proceed {
+					cursor_bound.borrow().run_authorizer_for_sql(py, &sql)?;
+					return Err(ExecTraceAbort::new_err("Execution aborted by exec trace"));
+				}
+				cursor = cursor_bound.borrow_mut();
+				cursor.skip_exec_trace_once = true;
+			}
+
+			cursor.executemany_pending = true;
+			cursor.executemany_bindings = bindings;
+			cursor.executemany_bindings_index = 0;
+			cursor.executemany_sql = Some(statements.to_string());
+			cursor.executemany_prepare_flags = prepare_flags;
+			cursor.executemany_explain = explain;
+		} else {
+			cursor.collecting_executemany = true;
+			let run_result: PyResult<()> = (|| {
+				for each in sequenceofbindings.try_iter()? {
+					let binding = each?;
+					let valid = cursor.is_mapping_binding(&binding)?
+						|| binding.cast::<PySequence>().is_ok()
+						|| binding.try_iter().is_ok();
+					if !valid {
+						return Err(pyo3::exceptions::PyTypeError::new_err(
+							"You must supply a dict or a sequence for each row",
+						));
+					}
+					cursor.execute_impl(py, statements, Some(&binding), prepare_flags, explain)?;
+					while cursor.fetchone_impl(py)?.is_some() {}
+				}
+				Ok(())
+			})();
+			cursor.collecting_executemany = false;
+			run_result?;
+			cursor.executemany_pending = false;
+			cursor.executemany_bindings.clear();
+			cursor.executemany_bindings_index = 0;
+			cursor.executemany_sql = None;
+			cursor.executemany_prepare_flags = 0;
+			cursor.executemany_explain = -1;
 		}
-		result?;
 		Ok(cursor_obj)
 	}
 
-	fn fetchone(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-		self.connection_db(py)?;
-		if self.executemany_pending {
-			if let Some(row) = self.executemany_results.get(self.executemany_result_index) {
-				let row = row.clone_ref(py);
-				self.executemany_result_index += 1;
-				if self.executemany_result_index >= self.executemany_results.len() {
-					self.executemany_pending = false;
-					self.executemany_results.clear();
-					self.executemany_result_index = 0;
-				}
-				return Ok(Some(row));
-			}
-			self.executemany_pending = false;
-			self.executemany_results.clear();
-			self.executemany_result_index = 0;
+	fn fetchone(slf: Py<Self>, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+		let mut cursor = slf
+			.bind(py)
+			.try_borrow_mut()
+			.map_err(|_| ThreadingViolationError::new_err("Cursor is being used recursively"))?;
+		if cursor.callback_depth > 0 {
+			return Err(ThreadingViolationError::new_err("Cursor is being used recursively"));
 		}
+		let row = cursor.fetchone_impl(py)?;
+		if row.is_some() && cursor.step_after_row_pending {
+			cursor.step_after_row_pending = false;
+			if let Err(err) = cursor.step_after_row(py) {
+				cursor.pending_fetch_error = Some(err);
+			}
+		}
+		Ok(row)
+	}
+
+	fn fetchone_impl(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+		self.connection_db(py)?;
 		loop {
+			if let Some(err) = self.pending_fetch_error.take() {
+				return Err(err);
+			}
+			if self.step_after_row_pending {
+				self.step_after_row_pending = false;
+				self.step_after_row(py)?;
+				continue;
+			}
+
+			if self.executemany_pending
+				&& self.stmt.is_null()
+				&& self.pending_sql.as_ref().is_none_or(|sql| !Self::sql_has_remaining_statements(sql))
+			{
+				if self.executemany_bindings_index >= self.executemany_bindings.len() {
+					self.executemany_pending = false;
+					self.executemany_bindings.clear();
+					self.executemany_bindings_index = 0;
+					self.executemany_sql = None;
+					self.executemany_prepare_flags = 0;
+					self.executemany_explain = -1;
+					self.last_short_description = None;
+					self.last_full_description = None;
+					self.last_description_full = None;
+					return Ok(None);
+				}
+
+				let binding = self
+					.executemany_bindings
+					.get(self.executemany_bindings_index)
+					.expect("binding index is in range")
+					.clone_ref(py);
+				self.executemany_bindings_index += 1;
+				let statements = self.executemany_sql.clone().unwrap_or_default();
+				let prepare_flags = self.executemany_prepare_flags;
+				let explain = self.executemany_explain;
+				let binding_bound = binding.bind(py);
+
+				self.collecting_executemany = true;
+				let result =
+					self.execute_impl(py, statements.as_str(), Some(&binding_bound), prepare_flags, explain);
+				self.collecting_executemany = false;
+				if let Err(err) = result {
+					self.executemany_pending = false;
+					self.executemany_bindings.clear();
+					self.executemany_bindings_index = 0;
+					self.executemany_sql = None;
+					self.executemany_prepare_flags = 0;
+					self.executemany_explain = -1;
+					return Err(err);
+				}
+				continue;
+			}
+
 			if !self.have_row || self.stmt.is_null() {
+				if !self.have_row
+					&& !self.stmt.is_null()
+					&& self.pending_sql.as_ref().is_none_or(|sql| !Self::sql_has_remaining_statements(sql))
+				{
+					self.finalize_statement();
+				}
 				if self.stmt.is_null()
-					&& self.pending_sql.as_ref().is_some_and(|sql| !sql.trim().is_empty())
+					&& self.pending_sql.as_ref().is_some_and(|sql| Self::sql_has_remaining_statements(sql))
 				{
 					self.advance_to_next_row(py)?;
 					continue;
 				}
-				if self.stmt.is_null() {
-					self.executemany_pending = false;
+				if self.stmt.is_null() && !self.executemany_pending {
+					self.executemany_bindings.clear();
+					self.executemany_bindings_index = 0;
+					self.executemany_sql = None;
+					self.executemany_prepare_flags = 0;
+					self.executemany_explain = -1;
 				}
 				self.last_short_description = None;
 				self.last_full_description = None;
@@ -2424,14 +2885,28 @@ impl Cursor {
 			self.last_full_description = Some(full_description.clone_ref(py));
 			self.last_description_full = Some(description_full.clone_ref(py));
 			self.last_short_description = Some(description.clone_ref(py));
-			self.step_after_row(py)?;
 
 			let Some(trace) = self.effective_row_trace(py) else {
+				self.step_after_row_pending = true;
 				return Ok(Some(row.unbind()));
 			};
 
 			let proxy = Py::new(py, RowTraceCursorProxy { description })?.into_any();
-			let value = trace.bind(py).call1((proxy, row.clone()))?;
+			self.callback_depth += 1;
+			let row_repr = row
+				.repr()
+				.map(|text| text.to_string_lossy().to_string())
+				.unwrap_or_else(|_| "<unrepresentable>".to_string());
+			let value = match trace.bind(py).call1((proxy, row.clone())) {
+				Ok(value) => value,
+				Err(err) => {
+					Self::augment_trace_error(py, &err, "APSWCursor_do_row_trace", Some((&"row", row_repr)));
+					self.callback_depth = self.callback_depth.saturating_sub(1);
+					return Err(err);
+				}
+			};
+			self.callback_depth = self.callback_depth.saturating_sub(1);
+			self.step_after_row_pending = true;
 			if value.is_none() {
 				continue;
 			}
@@ -2443,7 +2918,7 @@ impl Cursor {
 	fn fetchall(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
 		self.connection_db(py)?;
 		let mut rows = Vec::new();
-		while let Some(row) = self.fetchone(py)? {
+		while let Some(row) = self.fetchone_impl(py)? {
 			rows.push(row);
 		}
 		Ok(rows)

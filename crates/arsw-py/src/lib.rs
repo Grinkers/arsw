@@ -6,10 +6,10 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::mem::size_of;
 use std::path::Path;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::ThreadId;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::prelude::*;
 use pyo3::types::{
@@ -46,7 +46,11 @@ pub(crate) use session::{
 	Changeset, ChangesetBuilder, Rebaser, Session, TableChange, session_config,
 };
 pub(crate) use util::*;
-pub(crate) use vfs::{VFS, VFSFile, set_default_vfs, vfs_details, vfs_names};
+pub(crate) use vfs::{
+	URIFilename, VFS, VFSFcntlPragma, VFSFile, build_uri_filename_object, call_custom_vfs_xopen_null,
+	call_default_custom_vfs_xrandomness, run_custom_vfs_pragma, set_default_vfs, unregister_vfs,
+	vfs_details, vfs_names,
+};
 pub(crate) use vtable::*;
 
 const APSW_VERSION_HEADER: &str = include_str!("../../../src/apswversion.h");
@@ -54,6 +58,9 @@ const APSW_STUBS: &str = include_str!("../../../apsw/__init__.pyi");
 
 #[pyclass(name = "no_change", module = "apsw")]
 struct NoChange;
+
+#[pyclass(module = "apsw")]
+struct IndexInfo;
 
 #[pymethods]
 impl NoChange {
@@ -70,12 +77,25 @@ impl NoChange {
 	}
 }
 
+#[pymethods]
+impl IndexInfo {
+	#[new]
+	fn new() -> PyResult<Self> {
+		Err(pyo3::exceptions::PyTypeError::new_err("cannot create IndexInfo instances"))
+	}
+}
+
 #[pyclass(module = "apsw")]
 struct ConvertCursorProxy {
 	connection: Py<Connection>,
 	bindings_count: usize,
 	bindings_names: Py<PyTuple>,
 	description: Py<PyAny>,
+}
+
+#[pyclass(module = "apsw")]
+pub(crate) struct PyObjectBox {
+	pub(crate) value: Py<PyAny>,
 }
 
 #[pymethods]
@@ -170,8 +190,12 @@ struct StreamOutputData {
 static SESSION_TABLE_FILTERS: OnceLock<Mutex<HashMap<usize, Py<PyAny>>>> = OnceLock::new();
 static ALLOW_MISSING_DICT_BINDINGS: AtomicBool = AtomicBool::new(false);
 static CUSTOM_VFS_NAMES: OnceLock<Mutex<HashMap<String, i32>>> = OnceLock::new();
+static CUSTOM_VFS_OBJECTS: OnceLock<Mutex<HashMap<String, Py<PyAny>>>> = OnceLock::new();
 static SQLITE_LOG_HANDLER: OnceLock<Mutex<Option<Py<PyAny>>>> = OnceLock::new();
 static SQLITE_IS_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static RANDOMNESS_RESET_PENDING: AtomicBool = AtomicBool::new(false);
+static PYOBJECT_STORE: OnceLock<Mutex<HashMap<u64, Py<PyAny>>>> = OnceLock::new();
+static PYOBJECT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
 	static CALLBACK_ERROR: RefCell<Option<PyErr>> = const { RefCell::new(None) };
@@ -181,8 +205,37 @@ fn custom_vfs_names() -> &'static Mutex<HashMap<String, i32>> {
 	CUSTOM_VFS_NAMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn custom_vfs_objects() -> &'static Mutex<HashMap<String, Py<PyAny>>> {
+	CUSTOM_VFS_OBJECTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn sqlite_log_handler() -> &'static Mutex<Option<Py<PyAny>>> {
 	SQLITE_LOG_HANDLER.get_or_init(|| Mutex::new(None))
+}
+
+fn pyobject_store() -> &'static Mutex<HashMap<u64, Py<PyAny>>> {
+	PYOBJECT_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_pyobject(value: Py<PyAny>) -> u64 {
+	let token = PYOBJECT_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+	if let Ok(mut values) = pyobject_store().lock() {
+		values.insert(token, value);
+	}
+	token
+}
+
+fn lookup_pyobject(py: Python<'_>, token: u64) -> Option<Py<PyAny>> {
+	let values = pyobject_store().lock().ok()?;
+	values.get(&token).map(|value| value.clone_ref(py))
+}
+
+fn set_randomness_reset_pending(pending: bool) {
+	RANDOMNESS_RESET_PENDING.store(pending, Ordering::Relaxed);
+}
+
+fn take_randomness_reset_pending() -> bool {
+	RANDOMNESS_RESET_PENDING.swap(false, Ordering::Relaxed)
 }
 
 fn set_callback_error(py: Python<'_>, err: &PyErr) {
@@ -199,7 +252,7 @@ enum BindingsSource {
 	None,
 	Null,
 	Positional(Vec<Py<PyAny>>),
-	Named(Py<PyDict>),
+	Named(Py<PyAny>),
 }
 
 const RESULT_CODES: [(&str, i32); 31] = [
@@ -520,7 +573,13 @@ fn add_module_runtime_state(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult
 	)?;
 	m.add("async_run_coro", py.None())?;
 	m.add("c", py.None())?;
-	m.add("keywords", PySet::new(py, ["SELECT", "FROM", "WHERE", "VALUES", "CAST"])?)?;
+	m.add(
+		"keywords",
+		PySet::new(
+			py,
+			["SELECT", "FROM", "WHERE", "VALUES", "CAST", "INSERT", "UPDATE", "DELETE", "CREATE"],
+		)?,
+	)?;
 	m.add("_null_bindings", py.eval(pyo3::ffi::c_str!("object()"), None, None)?)?;
 	m.add("connection_hooks", PyList::empty(py))?;
 	m.add("no_change", Py::new(py, NoChange {})?)?;
@@ -561,6 +620,7 @@ fn apsw(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_function(wrap_pyfunction!(release_memory, m)?)?;
 	m.add_function(wrap_pyfunction!(set_default_vfs, m)?)?;
 	m.add_function(wrap_pyfunction!(shutdown, m)?)?;
+	m.add_function(wrap_pyfunction!(sleep, m)?)?;
 	m.add_function(wrap_pyfunction!(soft_heap_limit, m)?)?;
 	m.add_function(wrap_pyfunction!(sqlite_lib_version, m)?)?;
 	m.add_function(wrap_pyfunction!(sqlite3_sourceid, m)?)?;
@@ -568,10 +628,12 @@ fn apsw(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_function(wrap_pyfunction!(complete, m)?)?;
 	m.add_function(wrap_pyfunction!(strglob, m)?)?;
 	m.add_function(wrap_pyfunction!(stricmp, m)?)?;
+	m.add_function(wrap_pyfunction!(strnicmp, m)?)?;
 	m.add_function(wrap_pyfunction!(strlike, m)?)?;
 	m.add_function(wrap_pyfunction!(session_config, m)?)?;
 	m.add_function(wrap_pyfunction!(vfs_names, m)?)?;
 	m.add_function(wrap_pyfunction!(vfs_details, m)?)?;
+	m.add_function(wrap_pyfunction!(unregister_vfs, m)?)?;
 	m.add_function(wrap_pyfunction!(zeroblob, m)?)?;
 	m.add_class::<Connection>()?;
 	m.add_class::<Cursor>()?;
@@ -585,6 +647,9 @@ fn apsw(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_class::<FTS5Tokenizer>()?;
 	m.add_class::<VFS>()?;
 	m.add_class::<VFSFile>()?;
+	m.add_class::<URIFilename>()?;
+	m.add_class::<VFSFcntlPragma>()?;
+	m.add_class::<IndexInfo>()?;
 	m.add_class::<ExecTraceCursorProxy>()?;
 	m.add_class::<RowTraceCursorProxy>()?;
 	m.add_class::<ZeroBlob>()?;
