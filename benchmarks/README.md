@@ -35,8 +35,29 @@ git apply --reverse benchmarks/RESULT/CHANGE.patch
 ```
 
 Only changes improving both a focused benchmark and at least one speedtest
-case by more than 1.5% receive a patch file.  Source and extension binaries
+case by at least 1% receive a patch file.  Source and extension binaries
 must be restored to the common baseline before evaluating the next change.
+
+## Not worth it: second non-PGO scan
+
+The following independent experiments started from source baseline
+`22ddc459`.  They were removed and did not receive patch files:
+
+- A terminal `Cursor.__next__` `C_DONE` fast path is not reached by normal
+  iteration and regressed the focused execute loop by 2.7%.
+- A shorter uncontended cursor-mutex path improved the focused execute loop
+  by 1.4-2.0%, but regressed the 40-iteration `statements` speedtest by about
+  1% against bracketing baseline builds.
+- Retaining the binding kind improved focused bound execution by 2.1%, but
+  regressed the 40-iteration `statements` speedtest by about 1% against
+  bracketing baseline builds.
+- A description-cache dirty flag regressed focused execution by 0.3%.
+- Caching the result column count in each statement regressed focused row
+  conversion by 4.5%.
+- Reordering the synchronous async-controller check regressed focused row
+  conversion by 2.9%.
+- Checking text results first in scalar callback result conversion changed
+  focused callback cost by less than 0.1%.
 
 ## Create the environment
 
