@@ -1,0 +1,67 @@
+         Python /home/grinkers/code/arsw/.venv-benchmark/bin/python sys.version_info(major=3, minor=13, micro=14, releaselevel='final', serial=0)
+          Scale 10
+       Database :memory:
+            VFS (default)
+          Tests bigstmt, statements, statements_nobindings
+     Iterations 11
+Statement Cache 128
+
+
+   Testing with APSW file  /home/grinkers/code/arsw/apsw/__init__.cpython-313-x86_64-linux-gnu.so
+             APSW version  3.53.3.1
+       SQLite lib version  3.53.3
+   SQLite headers version  3053003
+
+
+Running tests - elapsed, CPU (in seconds, lower is better)
+
+1/11
+	apsw_bigstmt                            1.093 1.089
+	apsw_statements                         1.215 1.210
+	apsw_statements_nobindings              1.326 1.320
+2/11
+	apsw_bigstmt                            1.088 1.084
+	apsw_statements                         1.208 1.203
+	apsw_statements_nobindings              1.323 1.318
+3/11
+	apsw_bigstmt                            1.078 1.073
+	apsw_statements                         1.213 1.208
+	apsw_statements_nobindings              1.306 1.301
+4/11
+	apsw_bigstmt                            1.089 1.085
+	apsw_statements                         1.210 1.205
+	apsw_statements_nobindings              1.305 1.300
+5/11
+	apsw_bigstmt                            1.079 1.075
+	apsw_statements                         1.266 1.260
+	apsw_statements_nobindings              1.294 1.289
+6/11
+	apsw_bigstmt                            1.068 1.064
+	apsw_statements                         1.244 1.239
+	apsw_statements_nobindings              1.276 1.271
+7/11
+	apsw_bigstmt                            1.061 1.057
+	apsw_statements                         1.233 1.228
+	apsw_statements_nobindings              1.309 1.304
+8/11
+	apsw_bigstmt                            1.081 1.077
+	apsw_statements                         1.206 1.202
+	apsw_statements_nobindings              1.298 1.293
+9/11
+	apsw_bigstmt                            1.080 1.075
+	apsw_statements                         1.245 1.240
+	apsw_statements_nobindings              1.336 1.330
+10/11
+	apsw_bigstmt                            1.103 1.099
+	apsw_statements                         1.217 1.212
+	apsw_statements_nobindings              1.290 1.285
+11/11
+	apsw_bigstmt                            1.058 1.054
+	apsw_statements                         1.200 1.195
+	apsw_statements_nobindings              1.292 1.287
+
+Median (standard deviation) for elapsed, CPU time - in seconds, lower is better
+
+apsw_bigstmt                	1.080 (0.014)	1.075 (0.013)
+apsw_statements             	1.215 (0.021)	1.210 (0.020)
+apsw_statements_nobindings  	1.305 (0.018)	1.300 (0.018)

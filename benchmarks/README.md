@@ -8,6 +8,34 @@ Python build tooling used outside the project's build isolation.
 uv does not make the host CPU, kernel, C compiler, libc, or power policy
 reproducible.  Each baseline must record those separately.
 
+## Results
+
+- [`2026-07-17-f08ced5e`](2026-07-17-f08ced5e/README.md): initial baseline
+- [`2026-07-17-statement-cache`](2026-07-17-statement-cache/README.md):
+  statement-cache lookup optimization
+- [`2026-07-17-binding-count`](2026-07-17-binding-count/README.md): cached
+  binding metadata and zero-parameter fast path
+- [`2026-07-17-search-notes.md`](2026-07-17-search-notes.md): rejected and
+  refined experiments
+
+Optimization patches are independent and apply directly to the source
+baseline identified in their result directory.  Do not stack them while
+searching for gains.  For each experiment:
+
+```sh
+git apply benchmarks/RESULT/CHANGE.patch
+.venv-benchmark/bin/python setup.py build_ext \
+  -DSQLITE_ENABLE_COLUMN_METADATA --inplace --force --enable-all-extensions
+# Run focused and speedtest measurements.
+git apply --reverse benchmarks/RESULT/CHANGE.patch
+.venv-benchmark/bin/python setup.py build_ext \
+  -DSQLITE_ENABLE_COLUMN_METADATA --inplace --force --enable-all-extensions
+```
+
+Only changes improving both a focused benchmark and at least one speedtest
+case by more than 1.5% receive a patch file.  Source and extension binaries
+must be restored to the common baseline before evaluating the next change.
+
 ## Create the environment
 
 ```sh

@@ -1,0 +1,85 @@
+diff --git a/src/cursor.c b/src/cursor.c
+index 7a39ed6c..7951d416 100644
+--- a/src/cursor.c
++++ b/src/cursor.c
+@@ -833,7 +833,7 @@ APSWCursor_dobindings(APSWCursor *self)
+   if (Py_Is(self->bindings, apsw_cursor_null_bindings))
+     return 0;
+ 
+-  nargs = self->statement->vdbestatement ? sqlite3_bind_parameter_count(self->statement->vdbestatement) : 0;
++  nargs = self->statement->bindings_count;
+   if (nargs == 0 && !self->bindings)
+     return 0; /* common case, no bindings needed or supplied */
+ 
+@@ -1199,7 +1199,7 @@ APSWCursor_step(APSWCursor *self)
+     Py_CLEAR(self->description_cache[1]);
+     Py_CLEAR(self->description_cache[2]);
+ 
+-    if (APSWCursor_dobindings(self))
++    if ((self->bindings || self->statement->bindings_count) && APSWCursor_dobindings(self))
+     {
+       assert(PyErr_Occurred());
+       return -1;
+@@ -1327,7 +1327,7 @@ APSWCursor_execute(PyObject *self_, PyObject *const *fast_args, Py_ssize_t fast_
+   savedbindingsoffset = 0;
+ 
+   self->in_query = 1;
+-  if (APSWCursor_dobindings(self))
++  if ((self->bindings || self->statement->bindings_count) && APSWCursor_dobindings(self))
+     goto error_out;
+   if (EXECTRACE)
+   {
+@@ -1462,7 +1462,7 @@ APSWCursor_executemany(PyObject *self_, PyObject *const *fast_args, Py_ssize_t f
+   self->bindingsoffset = 0;
+   savedbindingsoffset = 0;
+ 
+-  if (APSWCursor_dobindings(self))
++  if ((self->bindings || self->statement->bindings_count) && APSWCursor_dobindings(self))
+     goto error_out;
+ 
+   if (EXECTRACE)
+@@ -2225,7 +2225,7 @@ APSWCursor_bindings_count(PyObject *self_, void *Py_UNUSED(unused))
+   if (!self->statement)
+     CURSOR_EXC_COMPLETE;
+ 
+-  return PyLong_FromLong(sqlite3_bind_parameter_count(self->statement->vdbestatement));
++  return PyLong_FromLong(self->statement->bindings_count);
+ }
+ 
+ /** .. attribute:: bindings_names
+diff --git a/src/statementcache.c b/src/statementcache.c
+index df5722b6..a26f0061 100644
+--- a/src/statementcache.c
++++ b/src/statementcache.c
+@@ -51,6 +51,7 @@ typedef struct APSWStatement
+   Py_hash_t hash;              /* hash of all of utf8 */
+   APSWStatementOptions options;
+   unsigned uses; /* how many times the prepared statement has been (re)used */
++  int bindings_count;
+ } APSWStatement;
+ 
+ /* recycle bin for APSWStatements to avoid repeated malloc/free calls */
+@@ -218,7 +219,7 @@ statementcache_prepare_internal(StatementCache *sc, const char *utf8, Py_ssize_t
+         sc->hashes[i] = SC_SENTINEL_HASH;
+         statement = sc->caches[i];
+         sc->caches[i] = NULL;
+-        res = sqlite3_clear_bindings(statement->vdbestatement);
++        res = statement->bindings_count ? sqlite3_clear_bindings(statement->vdbestatement) : SQLITE_OK;
+         if (res)
+         {
+           SET_EXC(res, sc->db);
+@@ -315,6 +316,7 @@ statementcache_prepare_internal(StatementCache *sc, const char *utf8, Py_ssize_t
+   statement->query_size = tail - utf8;
+   statement->utf8_size = utf8size;
+   statement->uses = 1;
++  statement->bindings_count = vdbestatement ? sqlite3_bind_parameter_count(vdbestatement) : 0;
+   memcpy(&statement->options, options, sizeof(APSWStatementOptions));
+ 
+   if (vdbestatement && tail == orig_tail && !statementcache_hasmore(statement))
+@@ -493,4 +495,4 @@ fail:
+   Py_XDECREF(res);
+   Py_XDECREF(entry);
+   return NULL;
+-}
+\ No newline at end of file
++}

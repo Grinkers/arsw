@@ -1,0 +1,142 @@
+diff --git a/src/statementcache.c b/src/statementcache.c
+index df5722b6..be222133 100644
+--- a/src/statementcache.c
++++ b/src/statementcache.c
+@@ -50,17 +50,23 @@ typedef struct APSWStatement
+                                   (the utf8 could have more than one query) */
+   Py_hash_t hash;              /* hash of all of utf8 */
+   APSWStatementOptions options;
+-  unsigned uses; /* how many times the prepared statement has been (re)used */
++  unsigned uses;        /* how many times the prepared statement has been (re)used */
++  int hash_counted;     /* hash_bins already includes this statement */
+ } APSWStatement;
+ 
+ /* recycle bin for APSWStatements to avoid repeated malloc/free calls */
+ #define SC_STATEMENT_RECYCLE_BIN_ENTRIES 4
+ 
++/* exact negative filter for cache lookup hashes */
++#define SC_HASH_BUCKETS 1024
++#define SC_HASH_MIN_SIZE 64
++
+ typedef struct StatementCache
+ {
+-  Py_hash_t *hashes;      /* array of hash values */
+-  APSWStatement **caches; /* corresponding statements */
+-  sqlite3 *db;            /* db to work against */
++  Py_hash_t *hashes;         /* array of hash values */
++  APSWStatement **caches;    /* corresponding statements */
++  unsigned short *hash_bins; /* counts of cache entries by hash bucket */
++  sqlite3 *db;               /* db to work against */
+ #if SC_STATEMENT_RECYCLE_BIN_ENTRIES > 0
+   APSWStatement *recycle_bin[SC_STATEMENT_RECYCLE_BIN_ENTRIES];
+   unsigned recycle_bin_next;
+@@ -84,6 +90,13 @@ typedef struct StatementCache
+ /* the hash value we use for unoccupied */
+ #define SC_SENTINEL_HASH (-1)
+ 
++static unsigned
++statementcache_hash_bin(Py_hash_t hash)
++{
++  Py_uhash_t value = (Py_uhash_t)hash;
++  return (value ^ (value >> 16)) & (SC_HASH_BUCKETS - 1);
++}
++
+ static int
+ statementcache_free_statement(StatementCache *sc, APSWStatement *s)
+ {
+@@ -140,9 +153,20 @@ statementcache_finalize(StatementCache *sc, APSWStatement *statement)
+     {
+       assert(sc->hashes[sc->next_eviction] != SC_SENTINEL_HASH);
+       evictee = sc->caches[sc->next_eviction];
++      if (sc->hash_bins)
++      {
++        unsigned bin = statementcache_hash_bin(evictee->hash);
++        assert(evictee->hash_counted && sc->hash_bins[bin]);
++        sc->hash_bins[bin]--;
++      }
+     }
+     sc->hashes[sc->next_eviction] = statement->hash;
+     sc->caches[sc->next_eviction] = statement;
++    if (sc->hash_bins && !statement->hash_counted)
++    {
++      sc->hash_bins[statementcache_hash_bin(statement->hash)]++;
++      statement->hash_counted = 1;
++    }
+     sc->highest_used = Py_MAX(sc->highest_used, sc->next_eviction);
+     sc->next_eviction++;
+     if (sc->next_eviction == sc->maxentries)
+@@ -208,12 +232,26 @@ statementcache_prepare_internal(StatementCache *sc, const char *utf8, Py_ssize_t
+     unsigned i;
+     hash = apsw_hash_bytes((void *)utf8, utf8size);
+ 
++    if (sc->hash_bins)
++    {
++      if (!sc->hash_bins[statementcache_hash_bin(hash)])
++        goto cache_miss;
++
++      /* Repeatedly used statements are returned to the newest cache slot. */
++      i = sc->next_eviction ? sc->next_eviction - 1 : sc->maxentries - 1;
++      if (i <= sc->highest_used && sc->hashes[i] == hash && sc->caches[i]->utf8_size == utf8size
++          && 0 == memcmp(utf8, sc->caches[i]->utf8, utf8size)
++          && 0 == memcmp(&sc->caches[i]->options, options, sizeof(APSWStatementOptions)))
++        goto cache_hit;
++    }
++
+     for (i = 0; i <= sc->highest_used; i++)
+     {
+       if (sc->hashes[i] == hash && sc->caches[i]->utf8_size == utf8size
+           && 0 == memcmp(utf8, sc->caches[i]->utf8, utf8size)
+           && 0 == memcmp(&sc->caches[i]->options, options, sizeof(APSWStatementOptions)))
+       {
++      cache_hit:
+         /* cache hit */
+         sc->hashes[i] = SC_SENTINEL_HASH;
+         statement = sc->caches[i];
+@@ -233,6 +271,7 @@ statementcache_prepare_internal(StatementCache *sc, const char *utf8, Py_ssize_t
+       }
+     }
+   }
++cache_miss:
+   /* cache miss */
+ 
+   /* Undocumented stuff alert:  if the size passed to sqlite3_prepare_v3
+@@ -315,6 +354,7 @@ statementcache_prepare_internal(StatementCache *sc, const char *utf8, Py_ssize_t
+   statement->query_size = tail - utf8;
+   statement->utf8_size = utf8size;
+   statement->uses = 1;
++  statement->hash_counted = 0;
+   memcpy(&statement->options, options, sizeof(APSWStatementOptions));
+ 
+   if (vdbestatement && tail == orig_tail && !statementcache_hasmore(statement))
+@@ -396,6 +436,7 @@ statementcache_free(StatementCache *sc)
+   if (sc)
+   {
+     PyMem_Free(sc->hashes);
++    PyMem_Free(sc->hash_bins);
+     if (sc->caches)
+     {
+       unsigned i;
+@@ -428,6 +469,7 @@ statementcache_init(sqlite3 *db, unsigned size)
+   {
+     res->hashes = size ? PyMem_Calloc(size, sizeof(Py_hash_t)) : 0;
+     res->caches = size ? PyMem_Calloc(size, sizeof(APSWStatement *)) : 0;
++    res->hash_bins = size >= SC_HASH_MIN_SIZE ? PyMem_Calloc(SC_HASH_BUCKETS, sizeof(unsigned short)) : 0;
+     res->maxentries = size;
+     res->db = db;
+     if (res->hashes)
+@@ -437,7 +479,7 @@ statementcache_init(sqlite3 *db, unsigned size)
+         res->hashes[i] = SC_SENTINEL_HASH;
+     }
+   }
+-  if (!res || (size && !res->hashes) || (size && !res->caches))
++  if (!res || (size && !res->hashes) || (size && !res->caches) || (size >= SC_HASH_MIN_SIZE && !res->hash_bins))
+   {
+     statementcache_free(res);
+     res = NULL;
+@@ -493,4 +535,4 @@ fail:
+   Py_XDECREF(res);
+   Py_XDECREF(entry);
+   return NULL;
+-}
+\ No newline at end of file
++}
