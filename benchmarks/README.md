@@ -17,6 +17,8 @@ reproducible.  Each baseline must record those separately.
   binding metadata and zero-parameter fast path
 - [`2026-07-17-search-notes.md`](2026-07-17-search-notes.md): rejected and
   refined experiments
+- [`2026-07-17-gcc-pgo`](2026-07-17-gcc-pgo/README.md): GCC profile-guided
+  optimization
 
 Optimization patches are independent and apply directly to the source
 baseline identified in their result directory.  Do not stack them while

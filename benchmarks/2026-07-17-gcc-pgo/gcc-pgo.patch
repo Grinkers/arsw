@@ -1,0 +1,72 @@
+diff --git a/Makefile b/Makefile
+index a1589fbe..2586d5f2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -30,7 +30,8 @@ GENEXAMPLES = \
+ 
+ .PHONY : help all tagpush clean doc docs build_ext build_ext_debug coverage pycoverage test test_debug fulltest linkcheck unwrapped \
+ 		 publish stubtest showsymbols compile-win setup-wheel source_nocheck source release pydebug \
+-		 fossil doc-depends dev-depends docs-no-fetch compile-win-one langserver source_check_extracted checkversion
++		 fossil doc-depends dev-depends docs-no-fetch compile-win-one langserver source_check_extracted checkversion \
++		 pgo-gcc pgo-gcc-generate pgo-gcc-train pgo-gcc-use
+ 
+ help: ## Show this help
+ 	@egrep -h '\s##\s' $(MAKEFILE_LIST) | sort | \
+@@ -121,6 +122,29 @@ build_ext: src/apswversion.h  apsw/__init__.pyi src/apsw.docstrings ## Fetches S
+ 	env $(PYTHON) setup.py fetch --version=$(SQLITEVERSION) --all build_ext -DSQLITE_ENABLE_COLUMN_METADATA --inplace --force --enable-all-extensions
+ 	env $(PYTHON) setup.py build_test_extension
+ 
++PGO_PROFILE_DIR=$(abspath build/pgo)
++PGO_CFLAGS=$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('CFLAGS') or '')")
++PGO_LDFLAGS=$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('LDFLAGS') or '')")
++PGO_BUILD=$(PYTHON) setup.py build_ext -DSQLITE_ENABLE_COLUMN_METADATA --inplace --force --enable-all-extensions
++
++pgo-gcc: pgo-gcc-use ## Builds the extension using GCC profile guided optimization
++
++pgo-gcc-generate:
++	rm -rf "$(PGO_PROFILE_DIR)"
++	mkdir -p "$(PGO_PROFILE_DIR)"
++	env CFLAGS="$(PGO_CFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR) -fprofile-update=atomic" \
++		LDFLAGS="$(PGO_LDFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" $(PGO_BUILD)
++
++pgo-gcc-train: pgo-gcc-generate
++	env PYTHONPATH=. $(PYTHON) -m apsw.tests
++	env PYTHONPATH=. $(PYTHON) -m apsw.speedtest --apsw --iterations 5 --hide-runs
++	env PYTHONPATH=. $(PYTHON) tools/pgo-training.py
++
++pgo-gcc-use: pgo-gcc-train
++	env CFLAGS="$(PGO_CFLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction \
++		-Werror=missing-profile -Werror=coverage-mismatch" \
++		LDFLAGS="$(PGO_LDFLAGS) -fprofile-use=$(PGO_PROFILE_DIR)" $(PGO_BUILD)
++
+ src/faultinject.h: tools/genfaultinject.py
+ 	-rm src/faultinject.h
+ 	tools/genfaultinject.py src/faultinject.h
+diff --git a/tools/pgo-training.py b/tools/pgo-training.py
+new file mode 100644
+index 00000000..8f580928
+--- /dev/null
++++ b/tools/pgo-training.py
+@@ -0,0 +1,22 @@
++#!/usr/bin/env python3
++
++import apsw
++
++
++def main():
++    rows = 250_000
++    db = apsw.Connection(":memory:")
++    db.execute("create table t(i integer, r real, s text, b blob, n)")
++    db.executemany("insert into t values(?,?,?,?,?)", ((i, i / 2, str(i), b"x", None) for i in range(rows)))
++
++    assert sum(1 for _ in db.execute("select * from t")) == rows
++
++    def pyid(*values):
++        return values[0]
++
++    db.create_scalar_function("pyid", pyid, 1)
++    assert db.execute("select sum(pyid(i)) from t").get == rows * (rows - 1) // 2
++
++
++if __name__ == "__main__":
++    main()
