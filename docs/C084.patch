@@ -1,26 +1,29 @@
-# C084: Mapper reinitialization leaks resources and can leave stale/dangling state
-#
-# CONFIRMED — reference leak (reproduced on Python 3.13.14)
-#
-# Python permits explicit repeated __init__ calls.  from_utf8_position_mapper
-# re-init overwrites an existing export/string without cleanup.  Verified:
-# refcount of the original string is unchanged after re-init with a different
-# string, proving the old export was not released.
-#
-# Run:
-#   PYTHONPATH=. python docs/C084.patch
-#
-import apsw._unicode as u
-import sys
-
-s1 = "hello world"
-s2 = "goodbye universe"
-
-fm = u.from_utf8_position_mapper(s1)
-rc_before = sys.getrefcount(s1)
-
-fm.__init__(s2)  # re-init leaks old export
-rc_after = sys.getrefcount(s1)
-
-assert rc_after >= rc_before, f"expected leak: {rc_before} -> {rc_after}"
-print(f"LEAK: s1 refcount {rc_before} -> {rc_after} (old export not released)")
+diff --git a/tests/confirmation/C084.py b/tests/confirmation/C084.py
+new file mode 100644
+index 00000000..65d90624
+--- /dev/null
++++ b/tests/confirmation/C084.py
+@@ -0,0 +1,23 @@
++"""C084 [HIGH] Mapper reinitialization leaks resources
++
++CONFIRMED: reference leak
++Python 3.13.14, debug build.
++
++from_utf8_position_mapper.__init__ called twice leaks the old export: string
++refcount unchanged after re-init with a different string.
++"""
++import apsw._unicode as u
++import sys
++
++s1 = "hello world"
++s2 = "goodbye universe"
++
++fm = u.from_utf8_position_mapper(s1)
++rc_before = sys.getrefcount(s1)
++
++fm.__init__(s2)  # re-init leaks old export
++rc_after = sys.getrefcount(s1)
++
++assert rc_after >= rc_before, f"expected leak: {rc_before} -> {rc_after}"
++print(f"LEAK: s1 refcount {rc_before} -> {rc_after} (old export not released)")
++print("CONFIRMED: re-init leaks old export (refcount unchanged)")

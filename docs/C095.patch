@@ -1,40 +1,36 @@
-# C095: xSetSystemCall(NULL, ...) passes NULL to PyUnicode_FromString
-#
-# CONFIRMED — crash (SIGSEGV, NULL dereference in strlen)
-#
-# The C-to-Python trampoline apswvfs_xSetSystemCall constructs the argument
-# array with PyUnicode_FromString(zName) inline.  When zName is NULL (SQLite
-# uses NULL to reset all system calls), PyUnicode_FromString(NULL) calls
-# strlen(NULL) → SIGSEGV before the if(vargs[2]&&vargs[3]) guard can help.
-#
-# GDB backtrace:
-#   SIGSEGV at __strlen_evex (libc)
-#   #0 strlen
-#   #1 PyUnicode_FromString
-#   #2 apswvfs_xSetSystemCall src/vfs.c:1492  (zName=0x0)
-#   #3 apswvfspy_xSetSystemCall src/vfs.c:1550
-#
-# Triggered by layering two APSW VFSes: the outer delegates xSetSystemCall
-# to super(), which calls the inner VFS's C trampoline with zName=NULL.
-#
-# Run:
-#   PYTHONPATH=. python docs/C095.patch
-#
-import apsw
-
-
-class InnerVFS(apsw.VFS):
-    def __init__(self):
-        apsw.VFS.__init__(self, "c095inner", "")
-
-
-class OuterVFS(apsw.VFS):
-    def __init__(self):
-        apsw.VFS.__init__(self, "c095outer", "c095inner")
-
-
-inner = InnerVFS()
-outer = OuterVFS()
-
-# Outer delegates to inner VFS C trampoline with name=None → NULL
-outer.xSetSystemCall(None, 0)
+diff --git a/tests/confirmation/C095.py b/tests/confirmation/C095.py
+new file mode 100644
+index 00000000..976ac8ca
+--- /dev/null
++++ b/tests/confirmation/C095.py
+@@ -0,0 +1,30 @@
++"""C095 [HIGH] xSetSystemCall(NULL, ...) passes NULL to PyUnicode_FromString
++
++CONFIRMED: crash (SIGSEGV, NULL dereference in strlen)
++Python 3.13.14, debug build.
++
++Layering two APSW VFSes: outer.xSetSystemCall(None, 0) delegates to the inner
++VFS C trampoline which calls PyUnicode_FromString(NULL) -> strlen(NULL).
++
++GDB: SIGSEGV at __strlen_evex (libc)
++     #1 PyUnicode_FromString
++     #2 apswvfs_xSetSystemCall src/vfs.c:1492 (zName=0x0)
++"""
++import apsw
++
++
++class InnerVFS(apsw.VFS):
++    def __init__(self):
++        apsw.VFS.__init__(self, "c095inner", "")
++
++
++class OuterVFS(apsw.VFS):
++    def __init__(self):
++        apsw.VFS.__init__(self, "c095outer", "c095inner")
++
++
++inner = InnerVFS()
++outer = OuterVFS()
++
++# Outer delegates to inner VFS C trampoline with name=None -> NULL
++outer.xSetSystemCall(None, 0)

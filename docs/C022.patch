@@ -1,26 +1,29 @@
-# C022: Numeric carray accepts unaligned contiguous buffers
-#
-# CONFIRMED — undefined behavior (unaligned pointer dereference)
-#
-# PyBUF_ANY_CONTIGUOUS does not promise alignment.  carray casts the pointer to
-# int*/int64*/double* and dereferences it.  An odd-offset byte slice is accepted.
-# On x86 this doesn't fault, but the unaligned access is UB (would SIGBUS on
-# strict-alignment targets like ARM).
-#
-# Run:
-#   PYTHONPATH=. python docs/C022.patch
-#
-import apsw, struct
-
-con = apsw.Connection("")
-
-# 1 byte padding + 2 int32s at odd offset 1
-raw = bytearray(9)
-struct.pack_into("<ii", raw, 1, 42, 99)
-
-mv = memoryview(raw)[1:9]  # unaligned for 4-byte int access
-ca = apsw.carray(mv, flags=apsw.SQLITE_CARRAY_INT32)
-rows = con.execute("SELECT value FROM carray(?)", (ca,)).fetchall()
-assert rows == [(42,), (99,)], f"Expected [(42,), (99,)], got {rows}"
-print(f"Unaligned int32* dereference accepted: {rows}")
-print("UB — would fault/SIGBUS on strict-alignment targets")
+diff --git a/tests/confirmation/C022.py b/tests/confirmation/C022.py
+new file mode 100644
+index 00000000..b608e61c
+--- /dev/null
++++ b/tests/confirmation/C022.py
+@@ -0,0 +1,23 @@
++"""C022 [HIGH] Numeric carray accepts unaligned contiguous buffers
++
++CONFIRMED: undefined behavior (unaligned pointer dereference)
++Python 3.13.14, debug build.
++
++PyBUF_ANY_CONTIGUOUS does not promise alignment.  carray casts the pointer to
++int*/int64*/double*.  An odd-offset byte slice is accepted.  On x86 this does
++not fault, but it is UB (would SIGBUS on strict-alignment targets like ARM).
++"""
++import apsw, struct
++
++con = apsw.Connection("")
++
++raw = bytearray(9)
++struct.pack_into("<ii", raw, 1, 42, 99)
++
++mv = memoryview(raw)[1:9]  # unaligned for 4-byte int access
++ca = apsw.carray(mv, flags=apsw.SQLITE_CARRAY_INT32)
++rows = con.execute("SELECT value FROM carray(?)", (ca,)).fetchall()
++assert rows == [(42,), (99,)], f"Expected [(42,), (99,)], got {rows}"
++print(f"Unaligned int32* dereference accepted: {rows}")
++print("UB -- would fault/SIGBUS on strict-alignment targets")
++print("CONFIRMED: unaligned buffer accepted by carray (UB)")

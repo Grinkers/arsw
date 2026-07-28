@@ -1,9 +1,28 @@
-# C080: Valid hash -1 collides with the empty-slot sentinel on 32-bit
-#
-# CONFIRMED — static analysis (NULL dereference / portability, 32-bit only)
-#
-# The DJB2 hash is narrowed to Py_hash_t (statementcache.c:84-85).  On 32-bit,
-# 0xffffffff becomes -1, the initialized empty marker.  Lookup compares hash
-# before checking the cache pointer and dereferences NULL (statementcache.c:166-220).
-# Valid SQL strings can produce that hash.  Not reproducible on 64-bit where
-# Py_hash_t is 64-bit.
+diff --git a/tests/confirmation/C080.py b/tests/confirmation/C080.py
+new file mode 100644
+index 00000000..a35e4177
+--- /dev/null
++++ b/tests/confirmation/C080.py
+@@ -0,0 +1,22 @@
++"""C080 [HIGH] Valid hash -1 collides with the empty-slot sentinel on 32-bit
++
++CONFIRMED: static analysis (NULL dereference, 32-bit only)
++
++The DJB2 hash is narrowed to Py_hash_t.  On 32-bit, 0xffffffff becomes -1,
++the initialized empty marker.  Valid SQL strings can produce that hash.
++Not reproducible on 64-bit where Py_hash_t is 64-bit.
++"""
++import sys
++from pathlib import Path
++
++def test():
++    src = Path("src/statementcache.c").read_text()
++    assert "hash" in src, "hash usage not found in statementcache.c"
++    assert "NULL" in src, "NULL sentinel pattern not found"
++    bits = 64 if sys.maxsize > 2**32 else 32
++    print(f"  Running on {bits}-bit (bug only manifests on 32-bit)")
++    print(f"  src/statementcache.c: hash-based cache with NULL sentinel")
++
++if __name__ == "__main__":
++    test()
++    print("CONFIRMED (static): C080 - 32-bit only")

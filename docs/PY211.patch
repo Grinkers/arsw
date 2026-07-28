@@ -1,8 +1,26 @@
-# PY211: The row labelled stdlib json.loads measures json.dumps
-#
-# CONFIRMED — static analysis (benchmark correctness)
-#
-# tools/json_bench.py:90 calls json.dumps(big_data_json) but labels the result
-# "stdlib json.loads" (line 91). This serializes an already-serialized JSON
-# string, adding escaping and outer quotes; it does not decode JSON. The
-# reported stdlib decode timing is invalid.
+diff --git a/tests/confirmation/PY211.py b/tests/confirmation/PY211.py
+new file mode 100644
+index 00000000..b684b6b4
+--- /dev/null
++++ b/tests/confirmation/PY211.py
+@@ -0,0 +1,20 @@
++"""PY211 [HIGH] The row labelled stdlib json.loads measures json.dumps
++
++CONFIRMED: static analysis (code path verified in source)
++Python 3.13.14.
++
++This test verifies the problematic code pattern exists in the current source
++tree. It does not execute the bug at runtime.
++"""
++from pathlib import Path
++
++def test():
++    src = Path('tools/json_bench.py').read_text()
++    needle = 'json.dumps(big_data_json)'
++    assert needle in src, f"Pattern not found: {needle} in tools/json_bench.py"
++    print(f"  tools/json_bench.py: OK - json.dumps called but labelled json.loads")
++
++
++if __name__ == "__main__":
++    test()
++    print("CONFIRMED (static): PY211")

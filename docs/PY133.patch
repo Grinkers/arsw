@@ -1,36 +1,42 @@
-# PY133: Archive extraction escapes the extraction root
-#
-# CONFIRMED — path traversal (file written outside extraction root)
-#
-# setup.py extract_entry normalizes the archive member name, discards the first
-# path component, and writes without validating resolved containment beneath
-# the extraction directory. os.pathsep is tested instead of os.sep, and
-# leading surviving .. components are not rejected. For example,
-# top/../../../outside normalizes to ../../outside and writes through
-# sqlite3/../outside.
-#
-# Run:
-#   PYTHONPATH=. python docs/PY133.patch
-#
-import os, pathlib, tempfile
-
-def extract_entry_vulnerable(contents, name, replace="sqlite3"):
-    """Replicates setup.py:258-268 logic."""
-    name = os.path.normpath(name)
-    if name.startswith(os.pathsep) or ":" in name:
-        raise Exception(f"Refusing to deal with {name}")
-    out_name = pathlib.Path(pathlib.Path(replace), *pathlib.Path(name).parts[1:])
-    out_name.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_name, "wb") as f:
-        f.write(contents)
-    return str(out_name)
-
-tmpdir = tempfile.mkdtemp(prefix="py133_")
-os.chdir(tmpdir)
-result = extract_entry_vulnerable(b"escaped!", "top/../../../outside")
-resolved = os.path.realpath(result)
-root = os.path.realpath("sqlite3")
-outside = os.path.join(tmpdir, "outside")
-assert os.path.exists(outside), "escape file not found"
-assert not resolved.startswith(root), "should have escaped root"
-print(f"CONFIRMED: wrote outside extraction root at {outside}")
+diff --git a/tests/confirmation/PY133.py b/tests/confirmation/PY133.py
+new file mode 100644
+index 00000000..c937c40e
+--- /dev/null
++++ b/tests/confirmation/PY133.py
+@@ -0,0 +1,36 @@
++"""PY133 [HIGH] Archive extraction escapes the extraction root
++
++CONFIRMED: path traversal (file written outside extraction root)
++Python 3.13.14.
++
++setup.py extract_entry normalizes the archive member name, discards the first
++path component, and writes without validating containment. os.pathsep is
++tested instead of os.sep, and surviving .. components are not rejected.
++"""
++import os, pathlib, tempfile
++
++def extract_entry_vulnerable(contents, name, replace="sqlite3"):
++    """Replicates setup.py:258-268 logic."""
++    name = os.path.normpath(name)
++    if name.startswith(os.pathsep) or ":" in name:
++        raise Exception(f"Refusing to deal with {name}")
++    out_name = pathlib.Path(pathlib.Path(replace), *pathlib.Path(name).parts[1:])
++    out_name.parent.mkdir(parents=True, exist_ok=True)
++    with open(out_name, "wb") as f:
++        f.write(contents)
++    return str(out_name)
++
++tmpdir = tempfile.mkdtemp(prefix="py133_")
++orig_cwd = os.getcwd()
++os.chdir(tmpdir)
++try:
++    result = extract_entry_vulnerable(b"escaped!", "top/../../../outside")
++    resolved = os.path.realpath(result)
++    root = os.path.realpath("sqlite3")
++    outside = os.path.join(tmpdir, "outside")
++    assert os.path.exists(outside), "escape file not found"
++    assert not resolved.startswith(root), "should have escaped root"
++    print(f"CONFIRMED: wrote outside extraction root at {outside}")
++finally:
++    os.chdir(orig_cwd)
++    import shutil; shutil.rmtree(tmpdir)

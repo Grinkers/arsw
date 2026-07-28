@@ -1,8 +1,26 @@
-# PY045: Existing database paths are deleted without explicit consent
-#
-# CONFIRMED — static analysis (data loss)
-#
-# speedtest.py:437 calls os.remove(options.database) before every test run if
-# the file exists. The --database help says only "The database file to use"
-# and does not disclose destructive replacement. Supplying an existing database
-# path silently and irreversibly destroys user data.
+diff --git a/tests/confirmation/PY045.py b/tests/confirmation/PY045.py
+new file mode 100644
+index 00000000..6396530b
+--- /dev/null
++++ b/tests/confirmation/PY045.py
+@@ -0,0 +1,20 @@
++"""PY045 [HIGH] Existing database paths are deleted without explicit consent
++
++CONFIRMED: static analysis (code path verified in source)
++Python 3.13.14.
++
++This test verifies the problematic code pattern exists in the current source
++tree. It does not execute the bug at runtime.
++"""
++from pathlib import Path
++
++def test():
++    src = Path('apsw/speedtest.py').read_text()
++    needle = 'os.remove(options.database)'
++    assert needle in src, f"Pattern not found: {needle} in apsw/speedtest.py"
++    print(f"  apsw/speedtest.py: OK - speedtest deletes existing database path without consent")
++
++
++if __name__ == "__main__":
++    test()
++    print("CONFIRMED (static): PY045")

@@ -1,31 +1,33 @@
-# C023: carray blob lengths above INT_MAX enter SQLite through a narrowing cast
-#
-# CONFIRMED — crash (SIGABRT, assertion failure)
-#
-# APSW permits a Py_buffer.len wider than int.  The blob path stores it in
-# struct iovec.iov_len (size_t).  SQLite's carray module narrows it to int
-# before calling sqlite3_result_blob, which asserts n>=0 in debug builds.
-#
-# Requires ~2GB+ of addressable memory (sparse mmap works).
-#
-# Run:
-#   PYTHONPATH=. python docs/C023.patch
-#
-import apsw, mmap, os, tempfile
-
-path = tempfile.mktemp(prefix="c023_")
-size = 2147483647 + 100  # just over INT_MAX
-
-fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
-os.ftruncate(fd, size)
-mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
-
-con = apsw.Connection("")
-ca = apsw.carray((mm,), flags=apsw.SQLITE_CARRAY_BLOB)
-# SQLite asserts n>=0 in sqlite3_result_blob because the size_t length
-# was narrowed to a negative int.
-rows = con.execute("SELECT length(value) FROM carray(?)", (ca,)).fetchall()
-
-mm.close()
-os.close(fd)
-os.unlink(path)
+diff --git a/tests/confirmation/C023.py b/tests/confirmation/C023.py
+new file mode 100644
+index 00000000..cfdd11da
+--- /dev/null
++++ b/tests/confirmation/C023.py
+@@ -0,0 +1,27 @@
++"""C023 [HIGH] carray blob lengths above INT_MAX narrow to negative int
++
++CONFIRMED: crash (SIGABRT, assertion failure)
++Python 3.13.14, debug build.
++
++APSW permits a Py_buffer.len wider than int.  The blob path stores it in
++struct iovec.iov_len (size_t).  SQLite narrows it to int before
++sqlite3_result_blob, which asserts n>=0 in debug builds.
++
++Requires ~2GB+ of addressable memory (sparse mmap works).
++"""
++import apsw, mmap, os, tempfile
++
++path = tempfile.mktemp(prefix="c023_")
++size = 2147483647 + 100  # just over INT_MAX
++
++fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
++os.ftruncate(fd, size)
++mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
++
++con = apsw.Connection("")
++ca = apsw.carray((mm,), flags=apsw.SQLITE_CARRAY_BLOB)
++rows = con.execute("SELECT length(value) FROM carray(?)", (ca,)).fetchall()
++
++mm.close()
++os.close(fd)
++os.unlink(path)

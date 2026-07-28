@@ -1,31 +1,30 @@
-# C004: Unicode offset parser accepts len+1 and feeds OOB reads
-#
-# CONFIRMED — bounds violation (OOB read past string terminator)
-#
-# ARG_PyUnicode_offset allows offset > 1 + PyUnicode_GET_LENGTH(text), i.e.
-# offsets 0..len+1 inclusive.  A valid position after a string is len, but the
-# parser admits len+1.  grapheme_next_break then uses PyUnicode_READ past the
-# guaranteed terminator, returning an incorrect boundary position.
-#
-# Under ASan/debug CPython this is an OOB heap read.  On a 3-char string the
-# break at position 4 is impossible (max is 3), proving the read went past end.
-#
-# Run:
-#   PYTHONPATH=. python docs/C004.patch
-#
-import apsw._unicode as u
-
-text = "abc"  # length 3; valid offsets are 0..3
-length = len(text)
-
-# offset len (3) is valid; offset len+1 (4) must be rejected but is accepted
-result = u.grapheme_next_break(text, length + 1)
-assert result == length + 1, f"expected {length+1}, got {result}"
-print(f"BUG: grapheme_next_break({text!r}, {length+1}) returned {result}")
-print(f"     A {length}-char string has no break at position {length+1}.")
-print(f"     The parser accepted offset {length+1} (max valid is {length}).")
-
-# Correct boundary
-result_ok = u.grapheme_next_break(text, length)
-assert result_ok == length, f"expected {length}, got {result_ok}"
-print(f"OK:   grapheme_next_break({text!r}, {length}) returned {result_ok}")
+diff --git a/tests/confirmation/C004.py b/tests/confirmation/C004.py
+new file mode 100644
+index 00000000..96eecb3f
+--- /dev/null
++++ b/tests/confirmation/C004.py
+@@ -0,0 +1,24 @@
++"""C004 [HIGH] Unicode offset parser accepts len+1 and feeds OOB reads
++
++CONFIRMED: bounds violation (OOB read past string terminator)
++Python 3.13.14, debug build.
++
++ARG_PyUnicode_offset allows offset > 1 + PyUnicode_GET_LENGTH(text), i.e.
++offsets 0..len+1 inclusive.  A valid position after a string is len, but the
++parser admits len+1.  grapheme_next_break then reads past the terminator.
++"""
++import apsw._unicode as u
++
++text = "abc"  # length 3; valid offsets are 0..3
++length = len(text)
++
++# offset len (3) is valid; offset len+1 (4) must be rejected but is accepted
++result = u.grapheme_next_break(text, length + 1)
++assert result == length + 1, f"expected {length+1}, got {result}"
++print(f"BUG: grapheme_next_break({text!r}, {length+1}) returned {result}")
++print(f"     A {length}-char string has no break at position {length+1}.")
++
++result_ok = u.grapheme_next_break(text, length)
++assert result_ok == length
++print(f"OK:   grapheme_next_break({text!r}, {length}) returned {result_ok}")
++print("CONFIRMED: offset len+1 accepted, OOB read past terminator")

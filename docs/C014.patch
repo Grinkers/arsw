@@ -1,79 +1,67 @@
-# C014: re-entrant backup.finish() during backup.step()
-#
-# CONFIRMED — use-after-free (SIGSEGV)
-#
-# backup() is called on the DESTINATION connection.  During step(), the GIL is
-# released (Py_BEGIN_ALLOW_THREADS) while SQLite holds both dbmutexes.  SQLite
-# calls the destination VFS xWrite; APSW's C shim reacquires the GIL and calls
-# the Python callback.  The callback calls backup.finish().  Because SQLite
-# connection mutexes are recursive, DBMUTEXES_ENSURE (sqlite3_mutex_try) in
-# finish() succeeds on the same thread, and close_internal calls
-# sqlite3_backup_finish on the backup that step() is still operating on.
-# When xWrite returns, sqlite3_backup_step resumes on freed state and crashes.
-#
-# GDB backtrace at crash:
-#   SIGSEGV at sqlite3_backup_step (sqlite3.c:85403)
-#       sqlite3_mutex_leave(p->pDestDb->mutex);
-#   #0 sqlite3_backup_step
-#   #1 APSWBackup_step  src/backup.c:194
-#
-# Run:
-#   PYTHONPATH=. python docs/C014.patch
-#
-import apsw, os, tempfile
-
-tmpdir = tempfile.mkdtemp(prefix="c014_")
-src_path = os.path.join(tmpdir, "src.db")
-dst_path = os.path.join(tmpdir, "dst.db")
-
-src = apsw.Connection(src_path)
-src.execute("PRAGMA page_size=4096; PRAGMA journal_mode=delete")
-src.execute("CREATE TABLE t(x)")
-for _ in range(5):
-    src.execute("INSERT INTO t VALUES (zeroblob(65536))")
-src.close()
-
-
-class C014VFS(apsw.VFS):
-    def __init__(self):
-        self.backup_ref = None
-        self.write_count = 0
-        self.finished = False
-        apsw.VFS.__init__(self, "c014vfs", "")
-
-    def xOpen(self, name, flags):
-        return C014VFSFile(self, "", name, flags)
-
-
-class C014VFSFile(apsw.VFSFile):
-    def __init__(self, vfs, parent, name, flags):
-        self.vfs = vfs
-        apsw.VFSFile.__init__(self, parent, name, flags)
-
-    def xWrite(self, data, offset):
-        self.vfs.write_count += 1
-        # On the 2nd write, re-entrantly call finish() while step() is running.
-        if not self.vfs.finished and self.vfs.backup_ref is not None and self.vfs.write_count == 2:
-            self.vfs.finished = True
-            self.vfs.backup_ref.finish()  # frees the backup that step() is using
-        return super().xWrite(data, offset)
-
-
-vfs = C014VFS()
-dst = apsw.Connection(dst_path, vfs="c014vfs")
-src = apsw.Connection(src_path)
-
-backup = dst.backup("main", src, "main")  # dst is the destination
-vfs.backup_ref = backup
-
-try:
-    backup.step(-1)  # crashes: use-after-free in sqlite3_backup_step
-    print("UNEXPECTED: step() returned normally")
-except Exception as e:
-    print(f"Got exception (some builds may raise instead of crash): {e}")
-
-src.close()
-dst.close()
-import shutil
-
-shutil.rmtree(tmpdir)
+diff --git a/tests/confirmation/C014.py b/tests/confirmation/C014.py
+new file mode 100644
+index 00000000..a096e522
+--- /dev/null
++++ b/tests/confirmation/C014.py
+@@ -0,0 +1,61 @@
++"""C014 [CRITICAL] Re-entrant backup.finish() during backup.step()
++
++CONFIRMED: use-after-free (SIGSEGV, exit 139)
++Python 3.13.14, debug build, SQLite 3.53.4.
++
++A custom VFS on the destination connection intercepts xWrite during
++backup.step(-1).  On the second write, the callback calls backup.finish().
++SQLite mutexes are recursive, so DBMUTEXES_ENSURE in finish() succeeds on
++the same thread.  close_internal calls sqlite3_backup_finish on the backup
++that sqlite3_backup_step is still operating on.  When xWrite returns,
++sqlite3_backup_step resumes on freed state and crashes.
++
++GDB: SIGSEGV at sqlite3_backup_step (sqlite3.c:85403)
++     sqlite3_mutex_leave(p->pDestDb->mutex)  <- freed backup pointer
++"""
++import apsw, os, tempfile
++
++tmpdir = tempfile.mkdtemp(prefix="c014_")
++src_path = os.path.join(tmpdir, "src.db")
++dst_path = os.path.join(tmpdir, "dst.db")
++
++src = apsw.Connection(src_path)
++src.execute("PRAGMA page_size=4096; PRAGMA journal_mode=delete")
++src.execute("CREATE TABLE t(x)")
++for _ in range(5):
++    src.execute("INSERT INTO t VALUES (zeroblob(65536))")
++src.close()
++
++
++class C014VFS(apsw.VFS):
++    def __init__(self):
++        self.backup_ref = None
++        self.write_count = 0
++        self.finished = False
++        apsw.VFS.__init__(self, "c014vfs", "")
++
++    def xOpen(self, name, flags):
++        return C014VFSFile(self, "", name, flags)
++
++
++class C014VFSFile(apsw.VFSFile):
++    def __init__(self, vfs, parent, name, flags):
++        self.vfs = vfs
++        apsw.VFSFile.__init__(self, parent, name, flags)
++
++    def xWrite(self, data, offset):
++        self.vfs.write_count += 1
++        if not self.vfs.finished and self.vfs.backup_ref is not None and self.vfs.write_count == 2:
++            self.vfs.finished = True
++            self.vfs.backup_ref.finish()  # frees the backup that step() is using
++        return super().xWrite(data, offset)
++
++
++vfs = C014VFS()
++dst = apsw.Connection(dst_path, vfs="c014vfs")
++src = apsw.Connection(src_path)
++
++backup = dst.backup("main", src, "main")
++vfs.backup_ref = backup
++
++backup.step(-1)  # crashes: use-after-free in sqlite3_backup_step

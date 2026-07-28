@@ -1,39 +1,41 @@
-# PY198: Broad session patterns suppress required mutex wrappers
-#
-# CONFIRMED — generated debug C lacks all session/changeset wrappers
-#
-# The broad pattern "sqlite3change(group|set)_.*" in functions_not_used
-# suppresses wrapper generation for all apply APIs and shadows the specific
-# sqlite3changegroup_schema rule (line 197). The v3 apply rule is also
-# misspelled ("sqlite3sessionchangeset_apply_v3" vs "sqlite3changeset_apply_v3").
-#
-# Run:
-#   PYTHONPATH=. python docs/PY198.patch
-#
-import sys
-sys.path.insert(0, ".")
-import tools.gensqlitedebug as g
-
-names = [
-    "sqlite3changeset_apply",
-    "sqlite3changeset_apply_strm",
-    "sqlite3changegroup_schema",
-    "sqlite3changeset_invert",
-    "sqlite3changeset_concat",
-]
-missing = 0
-for name in names:
-    code = g.code_for_name(name)
-    if "*not used*" in code:
-        status = "SUPPRESSED"
-        missing += 1
-    elif "sqlite3_mutex_held" in code:
-        status = "WRAPPED"
-    elif code == "":
-        status = "GLOBAL (no wrapper)"
-        missing += 1
-    else:
-        status = "OTHER"
-    print(f"  {name}: {status}")
-assert missing == 5, f"expected 5 missing, got {missing}"
-print(f"CONFIRMED: {missing}/5 session functions lack mutex wrappers")
+diff --git a/tests/confirmation/PY198.py b/tests/confirmation/PY198.py
+new file mode 100644
+index 00000000..e1c5238d
+--- /dev/null
++++ b/tests/confirmation/PY198.py
+@@ -0,0 +1,35 @@
++"""PY198 [HIGH] Broad session patterns suppress required mutex wrappers
++
++CONFIRMED: generated debug C lacks all session/changeset wrappers
++Python 3.13.14.
++
++The broad pattern "sqlite3change(group|set)_.*" in functions_not_used
++suppresses wrapper generation for all apply APIs and shadows the specific
++sqlite3changegroup_schema rule. All 5 functions lack mutex enforcement.
++"""
++import sys
++sys.path.insert(0, ".")
++import tools.gensqlitedebug as g
++
++names = [
++    "sqlite3changeset_apply",
++    "sqlite3changeset_apply_strm",
++    "sqlite3changegroup_schema",
++    "sqlite3changeset_invert",
++    "sqlite3changeset_concat",
++]
++missing = 0
++for name in names:
++    code = g.code_for_name(name)
++    if "*not used*" in code:
++        status = "SUPPRESSED"; missing += 1
++    elif "sqlite3_mutex_held" in code:
++        status = "WRAPPED"
++    elif code == "":
++        status = "GLOBAL (no wrapper)"; missing += 1
++    else:
++        status = "OTHER"
++    print(f"  {name}: {status}")
++
++assert missing == 5, f"expected 5 missing, got {missing}"
++print(f"CONFIRMED: {missing}/5 session functions lack mutex wrappers")

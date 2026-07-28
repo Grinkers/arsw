@@ -1,24 +1,22 @@
-# C077: Empty SQL with explain mode passes NULL to sqlite3_stmt_explain
-#
-# CONFIRMED — crash (SIGSEGV, NULL dereference)
-#
-# sqlite3_prepare_v3 returns SQLITE_OK with a NULL statement for empty,
-# comment-only, or semicolon-only SQL.  APSW then calls
-# sqlite3_stmt_explain(NULL, explain), which dereferences NULL via
-# sqlite3_db_mutex(db=0x0).
-#
-# GDB backtrace:
-#   SIGSEGV at sqlite3_db_mutex(db=0x0) sqlite3.c:188261
-#   #0 sqlite3_db_mutex
-#   #1 statementcache_prepare_internal src/statementcache.c:282
-#   #2 statementcache_prepare src/statementcache.c:356
-#   #3 APSWCursor_execute src/cursor.c:1317
-#
-# Run:
-#   PYTHONPATH=. python docs/C077.patch
-#
-import apsw
-
-con = apsw.Connection("")
-cur = con.cursor()
-cur.execute("", explain=1)  # crashes: NULL deref in sqlite3_stmt_explain
+diff --git a/tests/confirmation/C077.py b/tests/confirmation/C077.py
+new file mode 100644
+index 00000000..8bd7d329
+--- /dev/null
++++ b/tests/confirmation/C077.py
+@@ -0,0 +1,16 @@
++"""C077 [HIGH] Empty SQL with explain mode passes NULL to sqlite3_stmt_explain
++
++CONFIRMED: crash (SIGSEGV, NULL dereference)
++Python 3.13.14, debug build.
++
++sqlite3_prepare_v3 returns SQLITE_OK with a NULL statement for empty/comment
++SQL.  APSW then calls sqlite3_stmt_explain(NULL, explain), which dereferences
++NULL via sqlite3_db_mutex(db=0x0).
++
++GDB: SIGSEGV at sqlite3_db_mutex(db=0x0) sqlite3.c:188261
++"""
++import apsw
++
++con = apsw.Connection("")
++cur = con.cursor()
++cur.execute("", explain=1)  # crashes: NULL deref in sqlite3_stmt_explain

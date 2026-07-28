@@ -15,8 +15,18 @@ A confirmation marker records the outcome of each finding:
 
 - =confirmed= :: the actionable core described in the report was reproduced or
   statically proven on the target tree.  The finding entry references a patch
-  file under =docs/<ID>.patch= (for example =docs/C014.patch=) containing the
-  minimal repro/test used to confirm it.
+  file under =docs/<ID>.patch= (for example =docs/C014.patch=).  Each patch is
+  a proper git patch (apply with =git apply docs/<ID>.patch=) that adds a
+  standalone test file under =tests/confirmation/<ID>.py=.  Run it directly:
+
+  #+begin_src shell
+    git apply docs/C014.patch
+    PYTHONPATH=. python tests/confirmation/C014.py   # crash = confirmed
+    git apply -R docs/C014.patch                      # clean up
+  #+end_src
+
+  Runtime-confirmed findings crash or assert the buggy behavior.  Static
+  findings verify the code pattern exists in source via =assert=.
 - =confirmed-no-issue= :: the reported core is not actually a defect on the
   target tree (for example upstream fixed it, or the reported behavior does not
   hold).  The entry records the evidence.

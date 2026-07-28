@@ -1,55 +1,44 @@
-# C030: Failed window-function registration destroys callback state twice
-#
-# CONFIRMED — double-free / use-after-free (SIGSEGV under PYTHONMALLOC=debug)
-#
-# createFunctionApi (SQLite) wraps xDestroy in a FuncDestructor.  When
-# sqlite3CreateFunc fails (e.g. name > 255 bytes), pArg->nRef stays 0, so
-# createFunctionApi calls xDestroy(cbinfo) = apsw_free_func(cbinfo), which does
-# Py_XDECREF(cbinfo), freeing the FunctionCBInfo (refcount 1 → 0).
-# APSW's error path then calls apsw_free_func(cbinfo) AGAIN on the same freed
-# pointer.  Under PYTHONMALLOC=debug the freed memory is poisoned, and the
-# second Py_XDECREF crashes in PyObject_Str (the type pointer is corrupt).
-#
-# Note: the scalar-function path (create_scalar_function) was already fixed and
-# carries the comment "On error sqlite3_create_function_v4 calls the destructor"
-# — the window-function path was not similarly fixed.
-#
-# GDB backtrace at crash:
-#   SIGSEGV at 0xffffffffffffffff  (corrupt type pointer from freed object)
-#   #0 ???
-#   #1 PyObject_Str
-#
-# Run:
-#   PYTHONPATH=. PYTHONMALLOC=debug python docs/C030.patch
-#
-import apsw
-
-con = apsw.Connection("")
-
-
-class Win:
-    def __init__(self):
-        self.total = 0
-
-    def step(self, *args):
-        self.total += args[0]
-
-    def inverse(self, *args):
-        self.total -= args[0]
-
-    def value(self):
-        return self.total
-
-    def finalize(self):
-        return self.total
-
-
-# Force SQLite to reject the registration (name > 255 bytes).
-# SQLite calls apsw_free_func (destructor), then APSW calls it again.
-long_name = "x" * 300
-try:
-    con.create_window_function(long_name, Win, -1)
-    print("UNEXPECTED: registration succeeded")
-except Exception as e:
-    print(f"Registration failed (expected): {type(e).__name__}: {e}")
-    print("Double apsw_free_func already happened — crash may follow")
+diff --git a/tests/confirmation/C030.py b/tests/confirmation/C030.py
+new file mode 100644
+index 00000000..3e521dcc
+--- /dev/null
++++ b/tests/confirmation/C030.py
+@@ -0,0 +1,38 @@
++"""C030 [HIGH] Failed window-function registration destroys callback state twice
++
++CONFIRMED: double-free / use-after-free (SIGSEGV under PYTHONMALLOC=debug)
++Python 3.13.14, debug build.
++
++createFunctionApi wraps xDestroy in a FuncDestructor.  When sqlite3CreateFunc
++fails (name > 255 bytes), pArg->nRef stays 0, so createFunctionApi calls
++xDestroy(cbinfo) = apsw_free_func(cbinfo).  APSW's error path then calls
++apsw_free_func(cbinfo) AGAIN.  Under PYTHONMALLOC=debug the freed memory is
++poisoned and the second Py_XDECREF crashes.
++
++Run: PYTHONPATH=. PYTHONMALLOC=debug python -m tests.confirmation.C030
++"""
++import apsw
++
++con = apsw.Connection("")
++
++
++class Win:
++    def __init__(self):
++        self.total = 0
++
++    def step(self, *args):
++        self.total += args[0]
++
++    def inverse(self, *args):
++        self.total -= args[0]
++
++    def value(self):
++        return self.total
++
++    def finalize(self):
++        return self.total
++
++
++# Force SQLite to reject the registration (name > 255 bytes).
++# SQLite calls apsw_free_func (destructor), then APSW calls it again.
++con.create_window_function("x" * 300, Win, -1)

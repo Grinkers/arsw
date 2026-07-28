@@ -1,9 +1,26 @@
-# PY046: --data-size makes compared workloads unequal and run-order-dependent
-#
-# CONFIRMED — static analysis (benchmark correctness)
-#
-# With --data-size, number_name() (speedtest.py:131-135) consumes global random
-# state via random.randint(). Bindings SQL invokes it during execution while
-# no-bindings SQL invokes it during generation. Reused binding workloads
-# generate different data across drivers and iterations from mutable seeded
-# state. Alternating driver order changes which driver consumes each portion.
+diff --git a/tests/confirmation/PY046.py b/tests/confirmation/PY046.py
+new file mode 100644
+index 00000000..0d625c86
+--- /dev/null
++++ b/tests/confirmation/PY046.py
+@@ -0,0 +1,20 @@
++"""PY046 [HIGH] --data-size makes compared workloads unequal
++
++CONFIRMED: static analysis (code path verified in source)
++Python 3.13.14.
++
++This test verifies the problematic code pattern exists in the current source
++tree. It does not execute the bug at runtime.
++"""
++from pathlib import Path
++
++def test():
++    src = Path('apsw/speedtest.py').read_text()
++    needle = 'random.randint(1, options.size)'
++    assert needle in src, f"Pattern not found: {needle} in apsw/speedtest.py"
++    print(f"  apsw/speedtest.py: OK - number_name consumes mutable random state during execution")
++
++
++if __name__ == "__main__":
++    test()
++    print("CONFIRMED (static): PY046")

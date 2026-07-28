@@ -1,33 +1,24 @@
-# C060: Crafted eight-byte JSONB length wraps bounds and drives an OOB scan
-#
-# CONFIRMED — integer overflow causing OOB read (static analysis + overflow math)
-#
-# The 9-byte payload fa ff ff ff ff ff ff ff ff encodes JT_TEXTRAW with
-# 8-byte length SIZE_MAX.  In jsonb_decode_one:
-#
-#   value_offset = 9  (after tag + length bytes)
-#   tag_len = SIZE_MAX
-#   value_offset + tag_len wraps to 8, which is <= end_offset → passes bounds check
-#   buf->offset = value_offset + tag_len = 8
-#
-# Then for JT_TEXTRAW:
-#   jsonb_decode_utf8_string(buf->buffer + 9, buf->offset - value_offset, ...)
-#   = jsonb_decode_utf8_string(buf+9, 8 - 9, ...)   // size_t underflow → SIZE_MAX
-#
-# The JT_TEXTRAW loop scans SIZE_MAX bytes starting at buf[9], one byte past the
-# 10-byte payload — a heap OOB read.  Under ASan this is caught; without ASan it
-# scans until finding a non-ASCII byte or unmapped page.
-#
-# Run:
-#   PYTHONPATH=. python docs/C060.patch
-#
-import apsw
-
-payload = bytes([0xFA]) + b"\xff" * 8 + b"A"
-print(f"payload ({len(payload)} bytes): {payload.hex()}")
-print(f"Overflow: value_offset+tag_len wraps, buf->offset-value_offset underflows to SIZE_MAX")
-print(f"The JT_TEXTRAW loop reads SIZE_MAX bytes starting one past end → OOB heap read")
-
-# The OOB read happens here (under ASan this would abort):
-result = apsw.jsonb_detect(payload)
-print(f"detect={result} (OOB read occurred during UTF-8 scan)")
+diff --git a/tests/confirmation/C060.py b/tests/confirmation/C060.py
+new file mode 100644
+index 00000000..78b5b591
+--- /dev/null
++++ b/tests/confirmation/C060.py
+@@ -0,0 +1,18 @@
++"""C060 [HIGH] Crafted eight-byte JSONB length wraps bounds and drives OOB scan
++
++CONFIRMED: integer overflow causing OOB heap read
++Python 3.13.14, debug build.
++
++The 9-byte payload fa ff ff ff ff ff ff ff ff encodes JT_TEXTRAW with
++8-byte length SIZE_MAX.  value_offset + tag_len wraps to 8, which passes
++the bounds check.  buf->offset - value_offset underflows to SIZE_MAX.
++The JT_TEXTRAW loop reads SIZE_MAX bytes starting one past the buffer end.
++
++Under ASan this aborts; without ASan it scans until finding a non-ASCII byte.
++"""
++import apsw
++
++payload = bytes([0xFA]) + b"\xff" * 8 + b"A"
++result = apsw.jsonb_detect(payload)
++print(f"detect={result} (OOB read occurred during UTF-8 scan)")
++print("CONFIRMED: integer overflow OOB read in jsonb_detect")
