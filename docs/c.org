@@ -1,0 +1,2064 @@
+#+title: APSW C source audit
+#+date: 2026-07-28
+#+property: commit f08ced5e5b264955ea4c48182da4be2e13072113
+#+property: python-floor 3.10
+#+property: sqlite-version 3.53.3
+#+property: scope 24 tracked C files
+
+* Scope and method
+
+This is a read-only source audit.  One primary audit and one independent
+validation pass were performed for every tracked C file except
+~src/_unicodedb.c~, which was excluded at the request of the user because it
+is generated.  Related declarations and call sites were inspected only to
+validate findings.  No source remediation was performed.
+
+The checkout did not contain a built APSW extension, so findings were
+validated by source/control-flow analysis and local API contracts rather than
+by executing the extension.  Items whose manifestation is platform-, fault-,
+or schedule-dependent are explicitly qualified.
+
+Severity means:
+
+- *Critical*: a credible direct path to native use-after-free/corruption during
+  ordinary supported operation.
+- *High*: native memory safety, process crash, data race, or major resource
+  lifetime failure.
+- *Medium*: definite correctness, leak, portability, concurrency, or material
+  performance problem.
+- *Low*: narrow error path, diagnostics, standards-level portability issue, or
+  lower-impact optimization.
+
+* Executive summary
+
+The highest-priority areas are:
+
+1. Re-entrant callbacks invalidating active native objects in Backup and
+   BoxedCall.
+2. SQLite ownership-transfer mistakes after failed function/module
+   registration.
+3. Unsynchronized native-handle access in Cursor, Session, Backup, carray, and
+   ChangesetBuilder.
+4. Crafted JSONB lengths causing an out-of-bounds read.
+5. Iterator/TableChange and derived/base VFS lifetime errors.
+6. Missing bounds, alignment, and variadic-signature checks that cause C
+   undefined behavior.
+7. Error paths returning without an exception, leaking buffer exports, or
+   constructing invalid Python containers.
+
+The module currently relies on the GIL and legacy process-global state.  It
+must not claim ~Py_MOD_GIL_NOT_USED~.  Subinterpreter support should either be
+explicitly rejected or implemented through PEP 489 multi-phase initialization
+and per-module state.
+
+* Findings
+
+** src/apsw.c
+
+*** C001 [MEDIUM] Incorrect ~sqlite3_config~ variadic signatures
+:PROPERTIES:
+:FILE: src/apsw.c
+:LINES: 641-680, 2016-2019
+:CATEGORY: bug / undefined behavior / SQLite API
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~SQLITE_CONFIG_LOOKASIDE~ requires two trailing ~int~ arguments, but APSW
+parses and passes one.  Disabling ~SQLITE_CONFIG_LOG~ requires a callback and a
+context, but APSW passes only one ~NULL~.  Both make SQLite consume a missing
+variadic argument.  ~SQLITE_CONFIG_PMASZ~ is read by SQLite as ~unsigned int~;
+negative values passed as ~int~ are outside the compatible variadic exception,
+and the upper unsigned range is unavailable.
+
+- Direction: give LOOKASIDE its own two-value parser, pass both typed NULLs for
+  LOG, and parse/range-check PMASZ as unsigned.
+- Test: after shutdown, configure lookaside with size/count; disable LOG under
+  MSan/Valgrind; verify negative/out-of-range PMASZ values are rejected.
+
+*** C002 [LOW] Legacy global module state is not subinterpreter-safe
+:PROPERTIES:
+:FILE: src/apsw.c
+:LINES: 175-187, 426, 563, 1935-2154
+:CATEGORY: compatibility / CPython C API
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The module uses single-phase initialization with ~m_size == -1~ while keeping
+interpreter-owned objects in process-global variables.  A second interpreter
+cannot receive isolated state; teardown or callback attachment can affect the
+wrong interpreter.  This is an architectural limitation unless APSW claims
+subinterpreter support.
+
+- Direction: reject non-main/isolated interpreters in the short term.  Longer
+  term use PEP 489, per-module state, and module-associated heap types.
+- Test: import/use/destroy APSW in multiple subinterpreters under debug CPython;
+  until supported, assert deterministic rejection.
+
+*** C003 [LOW] Large ~randomness~ and ~complete~ operations retain the GIL
+:PROPERTIES:
+:FILE: src/apsw.c
+:LINES: 815-833, 1086-1102
+:CATEGORY: performance / concurrency
+:CONFIDENCE: medium-high
+:STATUS: benchmark
+:END:
+
+~sqlite3_randomness~ can fill an ~int~-sized buffer and ~sqlite3_complete~ scans
+arbitrarily large SQL while holding the GIL.  Their Python buffers remain
+owned for the call, so a narrow allow-threads region appears feasible.
+
+- Direction: benchmark, then release the GIL only around the SQLite call.
+- Test: run a heartbeat Python thread during large requests and verify progress
+  and unchanged results.
+
+** src/argparse.c
+
+*** C004 [HIGH] Unicode offset parser accepts ~len + 1~ and feeds OOB reads
+:PROPERTIES:
+:FILE: src/argparse.c
+:LINES: 337-352
+:CATEGORY: bug / undefined behavior / bounds
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+A valid position after a string is ~len~, but the parser admits ~len + 1~.
+Unicode break/category sinks in ~src/unicode.c~ then use ~PyUnicode_READ~ beyond
+the allocation (past even the guaranteed terminator).
+
+- Direction: make the inclusive upper bound exactly ~PyUnicode_GET_LENGTH~.
+- Test: every offset-taking Unicode API should accept ~len~ and reject
+  ~len + 1~ under ASan/debug CPython.
+
+*** C005 [MEDIUM] Unicode mapper keyword calls leak keyword tuples
+:PROPERTIES:
+:FILE: src/argparse.c
+:LINES: 497-518; src/unicode.c:2102-2124, 2253-2271
+:CATEGORY: reference leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~ARG_CONVERT_VARARGS_TO_FASTCALL~ creates an owned ~fast_kwnames~ tuple.  The
+two Unicode mapper initializers pass an empty epilog cleanup, leaking the tuple
+and keyword-name references on success and failure.
+
+- Direction: make cleanup intrinsic to the adapter or add
+  ~Py_XDECREF(fast_kwnames)~ at both sites.
+- Test: repeat keyword construction with dynamically created keys and verify
+  stable references/tracemalloc totals.
+
+*** C006 [LOW] Embedded-NUL keyword names alias valid keywords
+:PROPERTIES:
+:FILE: src/argparse.c
+:LINES: 19-35
+:CATEGORY: argument validation
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Keyword matching uses ~strcmp~ on Python UTF-8 data.  A key such as
+~"statement\0suffix"~ therefore matches ~"statement"~ instead of being
+rejected.
+
+- Direction: on Python 3.10-3.12 use ~PyUnicode_AsUTF8AndSize~ plus a
+  length-aware comparison; on 3.13+ use ~PyUnicode_EqualToUTF8~.
+- Test: pass NUL-suffixed keywords and assert ~TypeError~.
+
+*** C007 [MEDIUM] User-sized VLA is allocated before argument-count validation
+:PROPERTIES:
+:FILE: src/argparse.c
+:LINES: 495-510; src/util.c:7-14
+:CATEGORY: denial of service / undefined behavior
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The varargs-to-fastcall adapter allocates stack space from the complete
+positional and keyword counts before rejecting excess arguments.  A large
+expanded call can exhaust the native stack instead of raising ~TypeError~.
+This common root affects twelve constructor/initializer call sites.
+
+- Direction: reject against the known maximum before allocation, or use a
+  checked small-stack/heap fallback with ~Py_ssize_t~ indexes.
+- Test: in a low-stack subprocess, pass oversized ~*args~ and ~**kwargs~ and
+  require a normal Python exception rather than a signal.
+
+*** C008 [LOW] List-item error reports the list type, not the bad item type
+:PROPERTIES:
+:FILE: src/argparse.c
+:LINES: 199-219
+:CATEGORY: diagnostics
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The failing ~ARG_list_str~ diagnostic calls ~Py_TypeName~ on the container.
+Users see “list” rather than the offending item's type.
+
+- Direction: retain the item in a local and report its type.
+- Test: pass ~[object()]~ to the reachable tokenizer argument and assert the
+  message names ~object~ and its index.
+
+** src/async.c
+
+*** C009 [HIGH] Re-entrant BoxedCall clears an outer invocation's live state
+:PROPERTIES:
+:FILE: src/async.c
+:LINES: 75-112, 123-173
+:CATEGORY: use-after-free / reentrancy
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~BoxedCall~ remains in a callable state while executing arbitrary code.  A
+recursive call can fail entering the already-entered Context and still run
+~BoxedCall_clear~, freeing the outer invocation's context and arguments.
+Finalizers can also re-enter while cleanup decrefs objects before marking the
+box dormant.
+
+- Direction: transition to a running/clearing state before any callback or
+  decref; detach references before executing finalizers.
+- Test: re-enter through ~apsw.aio._tls.current_call.call~ and from an argument
+  finalizer in an ASan/debug subprocess.
+
+*** C010 [MEDIUM] BoxedCall is not visible to cyclic GC
+:PROPERTIES:
+:FILE: src/async.c
+:LINES: 12-120, 193-200
+:CATEGORY: resource leak / GC
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The object owns arbitrary Context, call arguments, connections, and callbacks
+but has no GC flag, traverse, or clear slots.  Abandoned call graphs can form
+uncollectable cycles retaining connections and worker resources.
+
+- Direction: make the variable-sized type GC-aware and coordinate ~tp_clear~
+  with the running-state fix.
+- Test: form a coroutine/argument/BoxedCall cycle, drop external references,
+  collect, and verify weakrefs die.
+
+*** C011 [LOW] Zero-argument async dispatch can call ~memcpy(NULL, ..., 0)~
+:PROPERTIES:
+:FILE: src/async.c
+:LINES: 310-325
+:CATEGORY: undefined behavior
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Vectorcall permits a NULL argument vector for zero arguments, but the code
+unconditionally calls ~memcpy~.  ISO C does not make NULL pointer arguments
+valid merely because the size is zero.
+
+- Direction: call ~memcpy~ only when ~total_args > 0~.
+- Test: use ~PyObject_CallNoArgs~ paths under UBSan.
+
+*** C012 [LOW] ~PyContext_Exit~ failure is ignored
+:PROPERTIES:
+:FILE: src/async.c
+:LINES: 129-163
+:CATEGORY: exception handling
+:CONFIDENCE: high
+:STATUS: needs-runtime-validation
+:END:
+
+A failed Context exit can leave an exception pending while the function returns
+a non-NULL result.  Normal invariants make this rare and C009 supplies the main
+concrete corruption route.
+
+- Direction: check the return, discard any successful call result, and preserve
+  deliberate exception chaining.
+- Test: fault-inject Context exit after successful and failed calls.
+
+** src/backup.c
+
+*** C013 [HIGH] Progress getters race with step and finish
+:PROPERTIES:
+:FILE: src/backup.c
+:LINES: 88-90, 193-204, 341-361
+:CATEGORY: data race / use-after-free
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~step~ and ~finish~ run with the GIL released.  ~remaining~ and ~page_count~
+call SQLite without either database mutex.  Concurrent step violates SQLite's
+getter contract; concurrent finish can free the handle while a getter uses it.
+
+- Direction: cache progress while both mutexes are held, or serialize getters
+  with the same operation/close state.
+- Test: poll during long step/finish under TSan/ASan.
+
+*** C014 [CRITICAL] A Python callback can re-entrantly finish an active backup
+:PROPERTIES:
+:FILE: src/backup.c
+:LINES: 81-122, 190-219, 233-252
+:CATEGORY: use-after-free / reentrancy
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+During ~sqlite3_backup_step~, a Python VFS or busy callback can reacquire the
+GIL and call ~finish~.  SQLite connection mutexes are recursive on the same
+thread, so nested finish can free the active backup.  The outer SQLite call
+then resumes on freed state and later dereferences cleared source/destination
+objects.
+
+- Direction: add a per-backup running/closing guard before entering SQLite and
+  reject nested step/finish/close/exit.
+- Test: have a VFS callback call ~finish~ during ~step~ and require a clean
+  reentrancy exception under ASan.
+
+** src/blob.c
+
+*** C015 [LOW] Blob offset arithmetic has reachable signed overflow
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 370-379, 448-457
+:CATEGORY: undefined behavior / bounds
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~read_into~ subtracts an unchecked extreme offset and later adds offset/length.
+~seek~ adds signed ~int~ values before range checking.  Python can supply values
+that overflow these expressions.
+
+- Direction: use checked ~sqlite3_int64~/~long long~ arithmetic and validate
+  before deriving lengths or narrowing.
+- Test: exercise LLONG_MIN and INT_MAX-relative seeks under UBSan.
+
+*** C016 [MEDIUM] Mutex contention leaks bytes objects and buffer exports
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 292-301, 363-397, 512-532
+:CATEGORY: resource leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~DBMUTEX_ENSURE~ returns directly.  In these paths resources have already been
+allocated/acquired: ~read~ leaks bytes, while ~read_into~ and ~write~ skip
+~PyBuffer_Release~, potentially leaving a bytearray permanently exported.
+
+- Direction: acquire the mutex first or route failure through cleanup labels.
+- Test: force contention, verify resize succeeds after failed buffer calls, and
+  check repeated failed reads for retained memory.
+
+*** C017 [MEDIUM] ~Blob.aclose~ on a synchronous connection succeeds without closing
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 604-618
+:CATEGORY: API correctness / resource ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+On a synchronous connection the async-dispatch macro does nothing; the method
+returns a successful coroutine without calling close and ignores ~force~.
+Although the method is intended for async objects, the runtime API should not
+silently report success.
+
+- Direction: reject async use in a synchronous context or deliberately perform
+  and document synchronous close.
+- Test: await ~aclose~ on a sync Blob and require either closure or the
+  documented context error.
+
+*** C018 [LOW] Context exit masks a block exception after manual close
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 657-688, 713-734
+:CATEGORY: exception handling / API consistency
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~__exit__~ and ~__aexit__~ check for closed before invoking idempotent close.
+Manual close in the body therefore raises ~ValueError~ at exit and can replace
+the body's original exception.
+
+- Direction: make exits use idempotent close and preserve the active exception.
+- Test: manually close inside sync/async contexts, with and without a marker
+  exception.
+
+*** C019 [LOW] ~zeroblob.length~ truncates on Windows LLP64
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 53-81
+:CATEGORY: portability / data correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The stored size is ~long long~ but is returned with ~PyLong_FromLong~.  A
+64-bit Windows ~long~ is only 32 bits.
+
+- Direction: use ~PyLong_FromLongLong~.
+- Test: on Windows assert ~zeroblob(1 << 40).length() == 1 << 40~.
+
+*** C020 [MEDIUM] Potentially blocking Blob I/O holds the GIL
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 158-177, 297-301, 391-397, 529-532, 766-772
+:CATEGORY: performance / concurrency
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+Large reads/writes and pager/VFS work execute while holding the GIL, unlike
+other potentially long SQLite calls.  This can stall unrelated Python threads
+and async event-loop work.
+
+- Direction: after fixing operation lifetime/locking, release the GIL only
+  around raw SQLite calls and cover Python VFS callback reacquisition.
+- Test: block a VFS read/write while a heartbeat thread must progress.
+
+*** C021 [LOW] An aborted Blob handle can be misreported as EOF or ValueError
+:PROPERTIES:
+:FILE: src/blob.c
+:LINES: 239-243, 281-290, 368-388, 443-457, 518-526, 763-775
+:CATEGORY: error semantics
+:CONFIDENCE: high
+:STATUS: needs-runtime-validation
+:END:
+
+After a failed reopen, SQLite can leave a non-NULL aborted handle for which
+~sqlite3_blob_bytes~ returns zero.  APSW's preflight can then return EOF or a
+local bounds error instead of the handle's ~SQLITE_ABORT~.  This does not apply
+to every ordinary row-update expiration.
+
+- Direction: track aborted state or ensure operations reach SQLite and preserve
+  its error consistently.
+- Test: fail reopen, then exercise read/read_into/write/seek.
+
+** src/carray.c
+
+*** C022 [HIGH] Numeric carray accepts unaligned contiguous buffers
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 180-183, 224-225, 268-270
+:CATEGORY: undefined behavior / alignment
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyBUF_ANY_CONTIGUOUS~ does not promise alignment.  SQLite carray casts the
+pointer to ~int *~, ~sqlite3_int64 *~, or ~double *~ and dereferences it.
+Odd-offset slices can fault on strict-alignment platforms.
+
+- Direction: enforce ~_Alignof~ for the selected type or copy into aligned
+  owned storage.
+- Test: query numeric memoryviews beginning at offset one under UBSan and on a
+  strict-alignment target.
+
+*** C023 [HIGH] carray blob lengths above ~INT_MAX~ enter SQLite through a narrowing cast
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 164-171
+:CATEGORY: bounds / SQLite API
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+APSW permits a ~Py_buffer.len~ wider than ~int~, while SQLite's carray path
+casts the iovec length before ~sqlite3_result_blob~.  Large lengths can become
+negative and violate SQLite's API, potentially causing incorrect or
+out-of-bounds reads when API armor is disabled.
+
+- Direction: reject lengths above the supported range or update the bundled
+  carray path to ~sqlite3_result_blob64~.
+- Test: use a sparse mapping larger than ~INT_MAX~ and require a clean
+  ~OverflowError~/~TooBigError~.
+
+*** C024 [HIGH] Writable carray buffers race SQLite scans executed without the GIL
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 164-171, 180-183, 268-270; src/cursor.c:1054-1057
+:CATEGORY: data race / correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+A buffer export pins lifetime and shape, not bytes.  Another Python thread can
+mutate a bytearray, array, writable memoryview, or NumPy array while
+~sqlite3_step~ reads it with the GIL released, producing torn values and native
+data races.
+
+- Direction: copy writable inputs, reject them, or define/enforce a locking
+  contract; preserve zero-copy for immutable exporters.
+- Test: mutate numeric and blob buffers concurrently under TSan.
+
+*** C025 [MEDIUM] carray allocation failures return without ~MemoryError~
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 126-131, 149-161
+:CATEGORY: exception handling
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Three raw Python allocator failures jump to cleanup without setting an
+exception, causing ~tp_init~ to return -1 with no exception and typically a
+secondary ~SystemError~.
+
+- Direction: call ~PyErr_NoMemory~ and add checked multiplication.
+- Test: fault each allocation independently and require ~MemoryError~ with no
+  leak.
+
+*** C026 [MEDIUM] CArrayBind owns references but is not GC tracked
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 18-25, 174-183, 285-315
+:CATEGORY: resource leak / GC
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The object owns a tuple and exporter references through ~Py_buffer.obj~ but has
+no GC protocol.  Custom exporters can hold a back-reference and create a
+permanent cycle.
+
+- Direction: add GC traversal/clear for every active exporter and tuple.
+- Test: form numeric and blob exporter cycles and verify collection/release.
+
+*** C027 [LOW] carray error formatting has variadic type mismatches
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 59-61, 74-91, 119-120, 141-142, 199-200, 225-251
+:CATEGORY: undefined behavior / diagnostics
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Several ~PyErr_Format~ calls pass ~int64_t~, ~Py_ssize_t~, or ~size_t~ to
+~%lld~, and one passes ~Py_ssize_t~ to ~%d~.  The mismatch is variadic UB even
+where common ABIs happen to print correctly.
+
+- Direction: use ~%zd~/~%zu~ or explicit matching casts.
+- Test: compile with format diagnostics and exercise every validation branch on
+  LP64 and Windows.
+
+*** C028 [LOW] carray bind destructor assumes an attached Python thread state
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 301-305; src/cursor.c:770-775
+:CATEGORY: CPython C API / lifetime
+:CONFIDENCE: medium-high
+:STATUS: needs-runtime-validation
+:END:
+
+The SQLite destructor calls bare ~Py_DECREF~, unlike APSW's equivalent object
+binding destructor which uses ~PyGILState_Ensure~.  Current audited finalize and
+clear paths appear attached to Python, so a detached-thread invocation was not
+confirmed.
+
+- Direction: defensively acquire/release Python state or formally constrain all
+  destructor call sites.
+- Test: instrument binding failure, rebind, clear, cache eviction, schema
+  reprepare, and close paths.
+
+*** C029 [LOW] Narrow carray slices retain the whole source tuple
+:PROPERTIES:
+:FILE: src/carray.c
+:LINES: 72-110, 174
+:CATEGORY: memory retention / performance
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Selecting a tiny slice keeps every excluded tuple item alive.  Blob views
+already retain selected exporters; text only needs selected strings.
+
+- Direction: retain selected objects only.
+- Test: weak-reference exporters outside the slice and verify prompt
+  collection.
+
+** src/connection.c
+
+*** C030 [HIGH] Failed window-function registration destroys callback state twice
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 3793-3809
+:CATEGORY: use-after-free / ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite invokes the supplied destructor when
+~sqlite3_create_window_function~ fails.  APSW then manually calls
+~apsw_free_func~ on the same ~FunctionCBInfo~, causing a double decref/UAF.
+Mutex-acquisition failure after allocation can also leak it.
+
+- Direction: finish all pre-call cleanup first; after passing data to SQLite,
+  clear the local pointer regardless of SQLite's result.
+- Test: force registration failure while a function is active and inject mutex
+  contention under ASan/ref-debug Python.
+
+*** C031 [HIGH] Virtual-table registration has double-free and pre-transfer leaks
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 4438-4466; src/vtable.c:1037-1052
+:CATEGORY: use-after-free / ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~sqlite3_create_module_v2~ invokes ~apswvtabFree~ on failure, but APSW's error
+path invokes it again.  The datasource reference also leaks if allocation,
+module-definition setup, or mutex acquisition fails before a usable owner is
+recorded.
+
+- Direction: record owned references immediately, centralize pre-transfer
+  cleanup, and set the local pointer NULL at the SQLite ownership boundary.
+- Test: fault every setup stage and registration itself; assert one datasource
+  finalization and no invalid frees.
+
+*** C032 [MEDIUM] Dependent registration leaks a Blob weakref or failed Cursor
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 939-948, 1082-1094
+:CATEGORY: reference leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+A successful Blob append returns without dropping the local weakref reference.
+If Cursor's dependent-list append fails, the owned cursor pointer is overwritten
+with NULL without decref, retaining the cursor and normally its connection.
+
+- Direction: decref the weakref after successful append and clear the cursor on
+  append failure.
+- Test: repeat Blob opens for stable allocations; fault Cursor append and verify
+  finalizers/weakrefs.
+
+*** C033 [MEDIUM] Multiple progress handlers ignore their own ~nsteps~
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 2193-2200, 2305-2344
+:CATEGORY: API correctness / performance
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite is configured with the minimum interval, and every active Python handler
+is called at every tick.  A handler requesting one million steps can therefore
+run every single step when another handler requests one.
+
+- Direction: maintain per-handler accumulators and use a base interval/GCD with
+  documented approximation semantics.
+- Test: register widely different intervals and compare callback counts.
+
+*** C034 [MEDIUM] PreUpdate rowids truncate on LLP64
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 7334, 7348
+:CATEGORY: portability / data correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~sqlite3_int64~ rowids are exposed with ~PyLong_FromLong~.  Values outside 32
+bits are lost on 64-bit Windows.
+
+- Direction: use a 64-bit Python integer constructor.
+- Test: update rowids around ~1 << 40~ on Windows.
+
+*** C035 [LOW] Empty BLOB comparison can call ~memcmp(NULL, NULL, 0)~
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 7550-7555
+:CATEGORY: undefined behavior / portability
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite may represent a zero-length BLOB with a NULL data pointer.  The standard
+library call is not portably valid with NULL pointers even at zero length.
+
+- Direction: handle zero bytes as equal before requesting pointers/calling
+  ~memcmp~.
+- Test: compare independent empty BLOB values under UBSan.
+
+*** C036 [LOW] Large database serialization retains the GIL
+:PROPERTIES:
+:FILE: src/connection.c
+:LINES: 2819-2825
+:CATEGORY: performance / concurrency
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+~sqlite3_serialize~ may allocate and copy a large database while blocking all
+Python threads.  Releasing the GIL requires auditing Python VFS exception paths.
+
+- Direction: benchmark and use a narrow allow-threads region if callback/error
+  handling is safe.
+- Test: serialize a large database while a heartbeat thread progresses.
+
+** src/constants.c
+
+*** C037 [LOW] Generated reverse mapping hides ~SQLITE_DBCONFIG_FP_DIGITS~
+:PROPERTIES:
+:FILE: src/constants.c
+:LINES: 226-253, especially 241 and 246
+:CATEGORY: generated-code bug / API mapping
+:CONFIDENCE: high
+:STATUS: open-in-generator
+:END:
+
+In pinned SQLite 3.53.3, ~SQLITE_DBCONFIG_FP_DIGITS~ and the sentinel
+~SQLITE_DBCONFIG_MAX~ are both 1023.  The later MAX insertion overwrites the
+integer-to-name entry, so a real operation is reported as the sentinel.
+
+- Direction: fix ~tools/genconstants.py~ to give operational constants
+  precedence over ~*_MAX~ aliases, then regenerate.
+- Test: assert both forward entries exist and reverse 1023 resolves to
+  ~SQLITE_DBCONFIG_FP_DIGITS~.
+
+** src/cursor.c
+
+*** C038 [HIGH] Cursor mutex wait races close and can dereference NULL or retain a mutex
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 594-669
+:CATEGORY: data race / lifetime
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~cursor_mutex_get~ repeatedly reads ~self->connection~ with the GIL released.
+Another thread can close the cursor and clear that field, causing a NULL/stale
+pointer dereference.  Another interleaving acquires the old mutex but skips
+release after observing the cleared connection, permanently retaining it.
+
+- Direction: hold a strong local Connection and cached mutex across the
+  allow-threads region; always release the cached mutex and revalidate state.
+- Test: coordinate holder/waiter/closer threads under ASan/TSan.
+
+*** C039 [HIGH] Cursor user callbacks run before the reentrancy guard
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 1270-1340, 1419-1476
+:CATEGORY: reentrancy / state corruption
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Binding conversion, iterator access, and execution tracing can execute arbitrary
+Python before ~in_query~ is set.  Recursive use of the same cursor can pass the
+recursive SQLite mutex and reset/replace the outer operation's statement,
+iterator, and bindings.  The window is clearest in ~executemany~ and also
+exists in ~execute~ before binding callbacks.
+
+- Direction: establish the busy/reentrancy state before any callback and clear
+  it on one cleanup path.
+- Test: recurse from a tracer, binding converter, and iterator.
+
+*** C040 [HIGH] ~resetcursor~ can return success with an iterator exception pending
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 200-223
+:CATEGORY: exception-state corruption
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+If probing the remaining ~executemany~ iterator raises, ~res~ can remain
+~SQLITE_OK~.  Debug builds hit an assertion; release callers continue while a
+Python exception is pending, leading to secondary errors or ~SystemError~.
+
+- Direction: set a failure result while preserving the iterator exception.
+- Test: use a generator that yields once and then raises, then reset/execute.
+
+*** C041 [HIGH] Python 3.10-3.11 async exception buffering creates tuples with NULL items
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 1686-1701, 1738-1746
+:CATEGORY: CPython C API / invalid object
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyErr_Fetch~ may return NULL value or traceback pointers, but they are inserted
+with ~PyTuple_SET_ITEM~.  This creates an invalid tuple consumed later by C and
+Python, replacing the original exception or risking a crash.
+
+- Direction: normalize the exception or represent missing fields with safe
+  sentinels and restore them deliberately.
+- Test: on 3.10/3.11 prefetch rows followed by a C-originated exception without
+  traceback.
+
+*** C042 [MEDIUM] Mapping detection loses the tri-state result of ~PyObject_IsInstance~
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 693-697; unsafe callers 965, 1158, 1434
+:CATEGORY: exception handling
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The helper collapses ~-1~ and false to zero.  Several callers fail to check the
+pending exception and continue treating the object as a sequence, causing
+secondary errors/assertions.
+
+- Direction: return and check an explicit tri-state at every caller.
+- Test: make ~__class__~ lookup raise during Mapping instance checks.
+
+*** C043 [MEDIUM] GC-tracked Cursor has no ~tp_clear~
+:PROPERTIES:
+:FILE: src/cursor.c
+:LINES: 346-361, 2606-2623
+:CATEGORY: resource leak / GC
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Cursor traverses callbacks, bindings, iterators, prefetched rows, and its
+Connection but supplies no clear operation.  Cycles not broken by another
+participant can retain statements, databases, and callbacks indefinitely.
+
+- Direction: add a clear path that breaks Python cycles while preserving enough
+  connection state for safe native finalization.
+- Test: form tracer/iterator/prefetched-row cycles and verify collection.
+
+** src/exceptions.c
+
+*** C044 [HIGH] Exception-class globals are dangling borrowed pointers after attribute replacement
+:PROPERTIES:
+:FILE: src/exceptions.c
+:LINES: 9-22, 39-45, 125-174, 237-238
+:CATEGORY: use-after-free / reference ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Most generated exception classes are added with stealing
+~PyModule_AddObject~, leaving process-global pointers that do not own a
+reference.  Users can replace/delete module attributes, destroying the class
+while C later passes the stale pointer to exception APIs.  ~APSWException~ is
+not affected in the same way because it uses ~PyModule_AddObjectRef~.
+
+- Direction: store owned references in per-module state and expose attributes
+  with ~PyModule_AddObjectRef~; protect lifecycle across surviving instances.
+- Test: replace/delete ~apsw.SQLError~ and an APSW-specific class, collect, then
+  trigger each exception under ASan.
+
+*** C045 [MEDIUM] Python exception text is omitted when SQLite's errmsg starts NULL
+:PROPERTIES:
+:FILE: src/exceptions.c
+:LINES: 257-273
+:CATEGORY: diagnostics / error propagation
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The helper allocates a message only under ~if (*errmsg && str)~.  Normal callers
+initialize the output to NULL, so the Python exception text is never installed.
+UTF-8 conversion is also unchecked.
+
+- Direction: allocate whenever ~str~ exists; replace/free an old message only
+  after successful conversion/allocation.
+- Test: call with NULL and existing messages; fault string, UTF-8, and SQLite
+  allocation paths.
+
+*** C046 [LOW] ~extendedresult~ can contradict the exception's primary SQLite class
+:PROPERTIES:
+:FILE: src/exceptions.c
+:LINES: 237-253
+:CATEGORY: API invariant
+:CONFIDENCE: high
+:STATUS: clarify-contract
+:END:
+
+Any positive integer in a mutable ~extendedresult~ replaces the class-derived
+code, including values with a different low-byte primary result.  This may be
+intentional flexibility; tests already expect explicit extended results.
+
+- Direction: document arbitrary override, or require the primary byte to match
+  the exception class.
+- Test: cover matching, mismatched, zero, negative, and overflowing values.
+
+** src/faultinject.c
+
+All findings in this section affect only ~APSW_FAULT_INJECT~ builds, not normal
+APSW builds.
+
+*** C047 [MEDIUM] Fault-injection hooks use unchecked Python allocations
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 33-44, 140-149
+:CATEGORY: invalid object / NULL dereference
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Unchecked objects are installed into tuples or passed to vectorcall.  On real
+OOM this can create NULL tuple slots and later unconditionally decref NULL.
+
+- Direction: build arguments in checked temporaries with partial cleanup.
+- Test: fail every allocation in an FI subprocess.
+
+*** C048 [MEDIUM] Python 3.12+ hook shape silently disables named APSW faults
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 140-145; tools/fi.py:942-947
+:CATEGORY: test false confidence / compatibility
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+3.10-3.11 passes ~(type, value, traceback)~, but 3.12+ passes ~(exception,)~.
+~tools/fi.py~ compares against ~(None, None, None)~, so the no-exception case
+never matches and named fault sites are skipped.
+
+- Direction: keep a stable three-item hook ABI or version all consumers.
+- Test: assert identical shapes and actual named-fault selection on every
+  supported Python minor.
+
+*** C049 [LOW] Fault hook recursion-limit arithmetic can overflow
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 15-16
+:CATEGORY: undefined behavior
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~recursion_limit + 50~ overflows signed ~int~ when the user selected a near
+~INT_MAX~ limit.
+
+- Direction: remove the global limit mutation or use checked/clamped arithmetic.
+- Test: set ~INT_MAX~ in a subprocess and run under UBSan.
+
+*** C050 [LOW] Temporary recursion-limit changes overwrite user/concurrent changes
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 15-16, 91, 112
+:CATEGORY: global-state race / performance
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The hook runs arbitrary Python while the interpreter-wide limit is temporarily
+changed, then restores a stale saved value.  Hook or concurrent changes can be
+silently lost.
+
+- Direction: avoid changing the global recursion limit per interception.
+- Test: coordinate two hooks and an intentional ~setrecursionlimit~ call.
+
+*** C051 [LOW] ~sys.apsw_should_fault = None~ aborts the process
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 128-151
+:CATEGORY: process abort / robustness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Unlike the other hook, this path does not treat ~None~ as disabled.  It
+vectorcalls None, then executes ~abort()~ on the resulting error.
+
+- Direction: handle None/missing/non-callable hooks deterministically without
+  abort during teardown.
+- Test: set None and trigger a named fault in a subprocess.
+
+*** C052 [LOW] Fault-control result does not validate its exception class
+:PROPERTIES:
+:FILE: src/faultinject.c
+:LINES: 62-65, 83-85
+:CATEGORY: diagnostics / validation
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The contract says ~(int, class, str)~, but an arbitrary second item reaches
+~PyErr_SetString~ and yields an unrelated ~SystemError~.
+
+- Direction: require ~PyExceptionClass_Check~ and report malformed hook output.
+- Test: return None, object instances, and exception instances as item two.
+
+** src/fileio_win32.c
+
+*** C053 [LOW] Loadable-extension SQLite API thunk can be rewritten concurrently
+:PROPERTIES:
+:FILE: src/fileio_win32.c
+:LINES: 19-22, 40-48, 64-71
+:CATEGORY: data race / integration
+:CONFIDENCE: high
+:STATUS: qualified
+:END:
+
+The Windows fileio DLL shares the standard global ~sqlite3_api~ pointer between
+upstream ~fileio.c~ and this helper.  Concurrent loads write it while callbacks
+read it.  In the normal single-SQLite-runtime deployment every write uses the
+same stable address, so practical impact is low despite formal C data-race UB.
+Loading the same DLL through different SQLite runtimes is materially dangerous
+because allocator/function tables can differ.
+
+- Direction: publish once under process-wide synchronization and reject a
+  different API table.
+- Test: concurrent load/callback stress on Windows; separately test two SQLite
+  runtimes.
+
+** src/fts.c
+
+*** C054 [HIGH] ~xSetAuxdata~ decrefs a borrowed value on SQLite failure
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 768-772, 787-799
+:CATEGORY: reference ownership / use-after-free
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite calls the supplied destructor on ~xSetAuxdata~ failure.  APSW passes the
+borrowed Python value and increments it only after success, so failure consumes
+a reference APSW never owned.
+
+- Direction: incref before the SQLite call; SQLite then owns/consumes that
+  reference on both success and failure.  Make FI behavior model the contract.
+- Test: force aux-data failure with a weak-referenceable sentinel under
+  ref-debug/ASan.
+
+*** C055 [HIGH] Ignored colocated tokens leak a ~PyGILState_Ensure~ level
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 84-114
+:CATEGORY: GIL / thread state
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The fast return for an ignored ~FTS5_TOKEN_COLOCATED~ token bypasses
+~PyGILState_Release~.  A third-party tokenizer invoking without the GIL can
+return while still holding/attaching Python state, causing deadlock or fatal
+thread-state behavior.
+
+- Direction: route every return through paired release.
+- Test: a C tokenizer releases the GIL, emits normal plus colocated tokens, and
+  restores it repeatedly under a watchdog.
+
+*** C056 [HIGH] Replacing SQL function ~fts5~ can cause a NULL API dereference
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 17-38
+:CATEGORY: NULL dereference / API validation
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The API lookup treats any ~SQLITE_ROW~ as success and dereferences ~api~ without
+checking that the canonical pointer-binding protocol populated it.  An
+application function registered as one-argument ~fts5~ can return a row while
+leaving it NULL.
+
+- Direction: require a non-NULL API pointer before reading ~iVersion~.
+- Test: replace ~fts5~ with a scalar returning None before first lookup and
+  require ~NoFTS5Error~, not a crash.
+
+*** C057 [LOW] Several FTS tuple builders grow quadratically
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 122-142, 917-981
+:CATEGORY: performance
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+Colocated tokens, instance tokens, and phrase columns repeatedly resize an
+immutable tuple by one, producing worst-case O(n²) pointer copying.
+
+- Direction: accumulate in a list/amortized buffer and convert once.
+- Test: measure scaling at doubled large token/synonym counts.
+
+*** C058 [LOW] Tokenizer locale length narrows to ~int~ without a bound
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 245-246, 283-284
+:CATEGORY: integer conversion / portability
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+A ~Py_ssize_t~ UTF-8 length is cast to the FTS ~int~ parameter.  The analogous
+extension-API path already performs a bound check.
+
+- Direction: reject lengths above ~INT_MAX~ consistently.
+- Test: inject an oversized logical length and ensure the tokenizer is not
+  called.
+
+*** C059 [LOW] FTS5 v4 callback fields are used without checking ~iVersion~
+:PROPERTIES:
+:FILE: src/fts.c
+:LINES: 1235-1281, 1315-1332
+:CATEGORY: ABI hardening
+:CONFIDENCE: high
+:STATUS: qualified
+:END:
+
+~xTokenize_v2~ and ~xColumnLocale~ require extension API version 4.  The pinned
+stock SQLite 3.53 supplies v4, so this is not reachable in the supported stock
+pairing; a custom/replaced provider could supply v3 and cause an out-of-struct
+function access.
+
+- Direction: check ~iVersion~; use old ~xTokenize~ without locale or report
+  unsupported locale APIs.
+- Test: use a shim exposing extension API v3.
+
+** src/jsonb.c
+
+*** C060 [HIGH] Crafted eight-byte JSONB length wraps bounds and drives an OOB scan
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 1203-1249, 1343-1367, 2145-2159
+:CATEGORY: out-of-bounds read / integer overflow
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The public nine-byte payload ~fa ff ff ff ff ff ff ff ff~ encodes
+~JT_TEXTRAW~ with length ~SIZE_MAX~.  ~value_offset + tag_len~ wraps, passes the
+bounds check, and later subtraction becomes ~SIZE_MAX~, causing UTF-8 scanning
+from one-past-end for an enormous apparent length.  Both detect and decode are
+exposed.
+
+- Direction: parse lengths with checked arithmetic and compare by subtraction
+  (~tag_len > end - value_offset~); reject high bytes on narrow platforms.
+- Test: run this and boundary-length corpora through detect/decode under ASan in
+  a subprocess.
+
+*** C061 [MEDIUM] Numeric subclasses are serialized through overridable ~__str__~
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 687-696, 730-783
+:CATEGORY: data correctness / API contract
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+With ~exact_types=False~, int/float subclasses are accepted as their parent but
+formatted by virtual ~PyObject_Str~.  An override can change value 1 to 999 or
+produce text tagged as numeric that APSW itself cannot decode.  Numeric mapping
+keys have the same issue.
+
+- Direction: normalize to exact built-in numeric values before formatting.
+- Test: subclasses returning a different number and invalid text; compare with
+  the documented parent-class semantics.
+
+*** C062 [MEDIUM] libc ~realloc~ failure returns without ~MemoryError~
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 493-531
+:CATEGORY: exception handling / process abort
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The code asserts that failed libc ~realloc~ set a Python exception.  It does
+not: debug builds abort, while release builds eventually return NULL without
+an exception and produce ~SystemError~.
+
+- Direction: call ~PyErr_NoMemory~ explicitly.
+- Test: force this exact realloc failure without a preexisting exception.
+
+*** C063 [LOW] Object decoder leaks its partial builder on insertion failure
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 1419-1476
+:CATEGORY: reference leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+If tuple creation, list append, or dict insertion fails, key/value are cleaned
+but the partially populated list/dict builder is not decref'd.
+
+- Direction: use one object-error cleanup path.
+- Test: fault second append/set and verify prior sentinel values are released.
+
+*** C064 [LOW] Hexadecimal ~parse_int~ callback receives base 0, not documented 16
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 1291-1315, 2264-2267
+:CATEGORY: API contract
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Implementation and generated documentation disagree observably for custom
+callbacks.
+
+- Direction: pass 16 or document and test base 0.
+- Test: decode positive/negative hexadecimal JSONB with a recording callback.
+
+*** C065 [LOW] Raw JSONB text is validated and UTF-8 decoded in two full passes
+:PROPERTIES:
+:FILE: src/jsonb.c
+:LINES: 1343-1370, 2141-2159
+:CATEGORY: performance
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+Non-ASCII ~JT_TEXTRAW~ is scanned by the custom validator, then processed again
+by CPython's Unicode decoder.  This is linear, not a correctness issue.
+
+- Direction: benchmark a specialized allocation path using strict
+  ~PyUnicode_DecodeUTF8~, retaining custom validation for detection/escaped
+  tags.
+- Test: preserve malformed UTF-8 behavior and benchmark multi-megabyte text.
+
+** src/pyutil.c
+
+*** C066 [LOW] Note-formatting failure loses the pending exception
+:PROPERTIES:
+:FILE: src/pyutil.c
+:LINES: 283-298
+:CATEGORY: exception handling
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The original exception is fetched only after ~PyUnicode_FromFormatV~ succeeds.
+If formatting fails, usually from OOM, its new exception replaces the original
+without chaining.
+
+- Direction: fetch the original first; restore it or chain it to formatting
+  failure.
+- Test: fault note formatting while argument conversion has already failed.
+
+*** C067 [MEDIUM] Exception chaining depends on private CPython symbols
+:PROPERTIES:
+:FILE: src/pyutil.c
+:LINES: 225-229, 249-254
+:CATEGORY: CPython compatibility / new API opportunity
+:CONFIDENCE: high
+:STATUS: modernization
+:END:
+
+~_PyErr_ChainExceptions*~ is private and has already changed across Python
+releases.  It is not a present runtime bug, but can become a compile/link/import
+failure on a future supported CPython.
+
+- Direction: on Python 3.12+ use public ~PyErr_GetRaisedException~,
+  ~PyException_SetContext~, and ~PyErr_SetRaisedException~; retain a normalized
+  fetch/restore implementation for 3.10-3.11.
+- Test: verify exception ~__context__~ on every supported minor and that no
+  private symbol remains in the binary.
+
+*** C068 [LOW] ~PyThreadState_GetDict~ NULL result is passed to a dict API
+:PROPERTIES:
+:FILE: src/pyutil.c
+:LINES: 315-333
+:CATEGORY: NULL handling / OOM
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The thread-state dictionary may return NULL without an exception when lazy
+creation fails.  Passing it directly to ~PyDict_GetItemWithError~ can assert or
+crash.
+
+- Direction: check the dictionary first; on 3.13+ optionally use
+  ~PyDict_GetItemRef~ after that check, with the GIL-protected fallback on
+  3.10-3.12.
+- Test: fault first thread-state-dict allocation in an attached thread.
+
+** src/session.c
+
+*** C069 [HIGH] ChangesetIterator keeps a dangling borrowed TableChange pointer
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 230-238, 1993-2042
+:CATEGORY: use-after-free / lifetime
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~last_table_change~ is not an owned reference.  Dropping the returned object
+before the next iteration leaves a pointer that the iterator writes through.
+Conversely, destroying the iterator finalizes SQLite state without
+invalidating a surviving TableChange, whose properties then use freed iterator
+and table-name storage.
+
+- Direction: own the last object, invalidate/clear it on advance and iterator
+  teardown, and return a separate reference.
+- Test: discard between ~next~ calls and retain TableChange after deleting its
+  iterator under ASan.
+
+*** C070 [HIGH] Several Session operations bypass the connection mutex and async affinity
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 758-845, 970-997
+:CATEGORY: data race / callback lifetime
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~table_filter~, ~config~, ~memory_used~, and ~changeset_size~ access/mutate
+SQLite Session state without ~dbmutex~ or async worker routing.  Replacing the
+filter can decref a callback while SQLite still holds/uses its raw context;
+64-bit state reads can race native updates.
+
+- Direction: route/reject async calls and serialize every Session API.  Swap
+  callback references atomically with respect to SQLite work.
+- Test: write while repeatedly replacing filters and reading/configuring under
+  ASan/TSan; cover async event-loop calls.
+
+*** C071 [HIGH] Schema-backed ChangesetBuilder uses a raw database without its mutex
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 2167-2227, 2386-2601
+:CATEGORY: data race / async affinity
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~sqlite3changegroup_schema~ retains the raw database; subsequent add/output
+work can consult schema/defaults.  Schema and builder operations neither hold
+the connection mutex nor route to the AsyncConnection worker, so they can race
+connection execution, schema changes, or close.
+
+- Direction: serialize all schema-backed operations and define coherent async
+  routing/rejection.
+- Test: concurrently alter/use schema while adding new-table changes under
+  TSan; repeat with active async worker work.
+
+*** C072 [MEDIUM] Session and ChangesetBuilder traversal is disabled by missing GC flags
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 1000-1007, 2660-2666, 2898-2974
+:CATEGORY: resource leak / GC
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Both types implement traverse but omit ~Py_TPFLAGS_HAVE_GC~.  A Session/filter
+cycle directly leaks native session and connection resources; builder cycles
+can occur through connection callbacks/subclasses.
+
+- Direction: complete the GC protocol with safe clear/native teardown.
+- Test: collect filter-to-Session and callback-to-builder cycles.
+
+*** C073 [HIGH] Builder bookkeeping failure leaves SQLite holding an untracked database pointer
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 2577-2597
+:CATEGORY: use-after-close / ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+After SQLite successfully stores the raw database, weakref creation or dependent
+list append can fail.  The builder remains usable but may not be registered for
+closure before the Connection, allowing later use of a closed database.
+
+- Direction: arrange bookkeeping before commit where possible; otherwise poison
+  and close the builder on any post-configuration failure.
+- Test: fault weakref/list append, close the connection, then verify the builder
+  is safely unusable.
+
+*** C074 [MEDIUM] Public ~session_config~ permits SQLite-defined undefined states
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 171-206
+:CATEGORY: API contract / global concurrency
+:CONFIDENCE: high
+:STATUS: qualified
+:END:
+
+SQLite says ~sqlite3session_config~ is not thread-safe and is undefined during
+Session calls or after any Session-related object exists.  APSW exposes it at
+all times with no lifecycle state or process-wide synchronization.  It is a
+low-level API whose upstream contract is linked, so impact depends on caller
+use.
+
+- Direction: restrict it to a synchronized pre-object initialization phase and
+  document untrackable external SQLite users.
+- Test: reject calls after creating any session/changegroup/rebaser object and
+  stress concurrent configuration.
+
+*** C075 [MEDIUM] Oversized builder BLOB path leaks its buffer export
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 2337-2352
+:CATEGORY: resource leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+After buffer acquisition, the ~len >= INT32_MAX~ branch jumps to failure
+without ~PyBuffer_Release~, retaining the exporter and potentially preventing
+resize forever.
+
+- Direction: release on every path or use the bounded buffer helper.
+- Test: custom oversized exporter should record exactly one release.
+
+*** C076 [LOW] Large callback-free changeset operations retain the GIL
+:PROPERTIES:
+:FILE: src/session.c
+:LINES: 1418-1491, 2182-2190, 2620-2627, 2760-2770
+:CATEGORY: performance / concurrency
+:CONFIDENCE: high
+:STATUS: benchmark-after-lifetime-fixes
+:END:
+
+Invert, concat, changegroup output, and rebase can be CPU/memory intensive.
+The file intentionally retains the GIL because native objects lack independent
+lifetime synchronization.
+
+- Direction: first fix object locking/lifetime; then benchmark narrow
+  allow-threads regions for callback-free operations.
+- Test: process large changesets while a heartbeat thread progresses.
+
+** src/statementcache.c
+
+*** C077 [HIGH] Empty SQL with explain mode passes NULL to ~sqlite3_stmt_explain~
+:PROPERTIES:
+:FILE: src/statementcache.c
+:LINES: 275-288
+:CATEGORY: NULL dereference
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~sqlite3_prepare_v3~ legitimately returns success with a NULL statement for
+empty/comment/separator-only SQL.  APSW records that fact, then calls
+~sqlite3_stmt_explain~ whenever explain is nonnegative.  Without SQLite API
+armor, the implementation dereferences NULL.
+
+- Direction: call explain only for a non-NULL statement.
+- Test: run empty/comment/semicolon SQL with explain 0, 1, and 2 in a subprocess.
+
+*** C078 [LOW] Recycle bin uses only three of four slots
+:PROPERTIES:
+:FILE: src/statementcache.c
+:LINES: 56-66, 96-100
+:CATEGORY: performance
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The insertion condition has an off-by-one, preventing use of index three.
+
+- Direction: compare ~next < entries~.
+- Test: expose counters in a test build and recycle/allocate four entries.
+
+*** C079 [LOW] Cache statistics wrap after ~UINT_MAX~
+:PROPERTIES:
+:FILE: src/statementcache.c
+:LINES: 53, 72-78, 150-153, 229-230, 307-311, 456-475
+:CATEGORY: accounting correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Lifetime counters and entry uses are unsigned 32-bit on common platforms and
+wrap after roughly 4.29 billion events.  Wrapping is defined C behavior but
+makes long-lived statistics decrease/reset.
+
+- Direction: use 64-bit counters and Python's unsigned-long-long conversion.
+- Test: initialize near the limit through a test hook and assert monotonicity.
+
+*** C080 [HIGH] Valid hash ~-1~ collides with the empty-slot sentinel on 32-bit
+:PROPERTIES:
+:FILE: src/statementcache.c
+:LINES: 84-85, 166-220, 426-437
+:CATEGORY: NULL dereference / portability
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The DJB2 hash is narrowed to ~Py_hash_t~; on 32-bit, 0xffffffff becomes -1,
+the initialized empty marker.  Lookup compares hash before checking the cache
+pointer and dereferences NULL.  Valid SQL strings can produce that hash.
+
+- Direction: use ~caches[i] == NULL~ as occupancy or remap the sentinel, and
+  check the pointer before dereference.
+- Test: execute a known -1-hash SQL string on 32-bit with caching enabled.
+
+*** C081 [MEDIUM] ~sqlite3_stmt_explain~ can reprepare while holding the GIL
+:PROPERTIES:
+:FILE: src/statementcache.c
+:LINES: 250-254, 280-282
+:CATEGORY: performance / concurrency
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+SQLite documents that explain mode changes can invoke a full reprepare.  Initial
+prepare releases the GIL, but this potentially comparable work does not.
+
+- Direction: after callback/error audit, use the same allow-threads pattern as
+  prepare.
+- Test: large explain-mode reprepare while another Python thread progresses.
+
+** src/stringconstants.c
+
+No independent defect was accepted.  The file is generated by
+~tools/genstrings.py~.  Its process-global Python object table is evidence for
+C002 and should be migrated only as part of the extension-wide module-state
+work.  The proposed performance change to intern every cached name was rejected
+as speculative without a benchmark.
+
+** src/testextension.c
+
+*** C082 [LOW] Test extension reports successful loading when function registration fails
+:PROPERTIES:
+:FILE: src/testextension.c
+:LINES: 25-29, 45-49
+:CATEGORY: test false confidence / SQLite API
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Both entry points discard ~sqlite3_create_function_v2~ results and always
+return success.  OOM or an active-statement ~SQLITE_BUSY~ leaves the function
+uninstalled while tests believe loading succeeded.
+
+- Direction: return the registration result and optionally populate the load
+  error message.
+- Test: reload while a statement using the function remains active; fault OOM.
+
+*** C083 [LOW] Test extension's standard SQLite API thunk has the same qualified race
+:PROPERTIES:
+:FILE: src/testextension.c
+:LINES: 4-5, 11-13, 25-48
+:CATEGORY: data race / test integration
+:CONFIDENCE: medium-high
+:STATUS: qualified
+:END:
+
+Concurrent loads rewrite the global standard ~sqlite3_api~ pointer while
+callbacks read it.  Same-runtime loads store the same pointer and practical
+impact is low; different SQLite runtimes are dangerous.  This is a test-only
+artifact and the standard loadable-extension pattern.
+
+- Direction: publish once/reject a different thunk if cross-runtime loading is
+  within scope.
+- Test: concurrent load/callback TSAN harness.
+
+** src/traceback.c
+
+No actionable findings.  Exception preservation, ownership, GIL/thread-state
+assumptions, and the Python 3.10-only direct frame field access were validated.
+The proposed code/frame caching optimization was rejected as low-value work on
+an exception-only path.
+
+** src/unicode.c
+
+*** C084 [HIGH] Mapper reinitialization leaks resources and can leave stale/dangling state
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 2030-2042, 2101-2124, 2173-2180, 2252-2271, 2453-2487
+:CATEGORY: use-after-free / initialization
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Python permits explicit repeated ~__init__~ calls.  To-UTF8 overwrites an
+existing export/string without cleanup and a failed decode leaves a callable
+with released buffer state.  From-UTF8 leaks its old bytes owner and retains
+stale offsets.  OffsetMapper finalizes content but does not reset length, so
+later materialization can expose incorrectly initialized Unicode storage.
+
+- Direction: prohibit repeated init with the project's existing guard, or build
+  new state transactionally and reset every field.
+- Test: successful and failing reinit after advancing each mapper under ASan and
+  fault injection.
+
+*** C085 [MEDIUM] OffsetMapper has reachable signed offset overflow
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 2345-2370, 2391, 2440-2445
+:CATEGORY: undefined behavior / integer overflow
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+A source offset of ~PY_SSIZE_T_MAX~ plus an interpolated character displacement
+can overflow without requiring a huge string.  Length/count allocation
+arithmetic has additional unchecked sites.
+
+- Direction: use checked ~Py_ssize_t~ addition/multiplication and raise
+  ~OverflowError~.
+- Test: add a multi-character segment at ~sys.maxsize~ and query its second
+  output character under UBSan.
+
+*** C086 [LOW] Mutable UTF-8 buffers invalidate mapper validation
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 2078-2096, 2107-2117
+:CATEGORY: data correctness / assertion failure
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The mapper validates once but retains a live writable ~PyBUF_SIMPLE~ view and
+rescans it later.  Mutation can disagree with the decoded string, return bogus
+offsets, or abort assert-enabled builds on malformed continuation bytes.
+
+- Direction: snapshot immutable bytes, reject writable exporters, or derive
+  widths from the immutable decoded string.
+- Test: mutate bytearray/memoryview after construction.
+
+*** C087 [LOW] Two mapper types can form cycles invisible to GC
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 2016-2028, 2107-2116, 2309-2361, 2518-2522
+:CATEGORY: resource leak / GC
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+To-UTF8 retains arbitrary exporters and OffsetMapper can retain string
+subclasses; either can hold a back-reference.  From-UTF8 retains an exact bytes
+object and is not clearly affected.
+
+- Direction: add GC protocol to affected types or snapshot exact built-ins.
+- Test: exporter/string-subclass back-reference cycles should collect.
+
+*** C088 [LOW] Extreme ~grapheme_find~ bounds underflow signed arithmetic
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 1683-1718
+:CATEGORY: undefined behavior
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+With ~end == PY_SSIZE_T_MIN~ and a longer substring, normalization subtracts
+before the existing early-out and can underflow.  The result is normally later
+discarded, limiting practical impact.
+
+- Direction: reject longer needles first and use checked/slice-normalization
+  arithmetic.
+- Test: compare extreme bounds with ~str.find~ under UBSan.
+
+*** C089 [LOW] Unicode mapper allocation failures omit ~MemoryError~
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 2352-2358, 2475-2485
+:CATEGORY: exception handling
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Failed ~PyMem_Resize~/~PyMem_Calloc~ returns NULL without setting an exception,
+leading to ~SystemError~.
+
+- Direction: call ~PyErr_NoMemory~ while retaining old valid state.
+- Test: fault both allocations independently.
+
+*** C090 [LOW] Negative grapheme slicing boxes every boundary
+:PROPERTIES:
+:FILE: src/unicode.c
+:LINES: 1803-1862
+:CATEGORY: performance / memory
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+Resolving a negative endpoint builds a list and ~PyLong~ for every grapheme,
+using O(n) Python objects in addition to the necessary O(n) scan.
+
+- Direction: count clusters, normalize the slice, then scan to the two required
+  boundaries with O(1) auxiliary memory.
+- Test: benchmark peak memory on multi-million-character strings.
+
+C004 is rooted in ~src/argparse.c~ but has its principal sinks here.  C005 and
+C007 also include Unicode mapper call sites and are not duplicated.
+
+** src/util.c
+
+*** C091 [HIGH] Failed ~PyMem_Resize~ destroys the pending-call queue pointer
+:PROPERTIES:
+:FILE: src/util.c
+:LINES: 115-123, 154-176
+:CATEGORY: NULL dereference / resource leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyMem_Resize~ is an assigning macro.  On failure it overwrites the global
+~pending_call_slots~ with NULL while count remains nonzero, leaks the old
+allocation, and leaves the already registered dispatcher to index NULL.  It
+also fails to establish ~MemoryError~.
+
+- Direction: use a temporary ~PyMem_Realloc~ result with checked size, update
+  globals only after success, and set ~PyErr_NoMemory~.
+- Test: fail growth with an existing queued destructor; the original callback
+  must still run without a crash.
+
+*** C092 [MEDIUM] Virtual-table IN conversion discards meaningful SQLite statuses
+:PROPERTIES:
+:FILE: src/util.c
+:LINES: 328, 350-382
+:CATEGORY: error propagation / API semantics
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+All non-OK results from ~sqlite3_vtab_in_first~ become Python None.  Ordinary
+~SQLITE_ERROR~ is expected when probing a non-IN NULL, but ~SQLITE_DONE~ should
+represent an empty collection and failures such as ~SQLITE_NOMEM~ should
+propagate.
+
+- Direction: distinguish DONE, expected ERROR fallback, and real errors.
+- Test: empty all-at-once IN plus faulted NOMEM.
+
+*** C093 [MEDIUM] Pending destructor queue has quadratic growth and permanent high-water scans
+:PROPERTIES:
+:FILE: src/util.c
+:LINES: 98-164
+:CATEGORY: performance / memory retention
+:CONFIDENCE: high
+:STATUS: benchmark
+:END:
+
+Every enqueue scans from zero and grows by one.  N occupied entries cost O(n²)
+work/reallocations, and the count never shrinks, so later dispatch scans the
+largest historical burst.
+
+- Direction: track capacity separately, grow geometrically, and maintain free
+  slots/trim trailing holes.
+- Test: instrument allocations and probes during a large contention burst.
+
+The global queue also reinforces C002: if subinterpreters were supported, a
+pending callback could run an object's destructor in the wrong interpreter.
+C007 is the accepted common VLA issue and includes the macro definitions here.
+
+** src/vfs.c
+
+*** C094 [HIGH] Derived VFS can outlive an unretained APSW base
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 1727-1734, 1826, 1872-1897
+:CATEGORY: use-after-free / ownership
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+APSW detects whether a base is an APSW object by comparing only ~xAccess~ with
+the APSW trampoline.  A base created with ~exclude={"xAccess"}~ has NULL there,
+so the child takes no strong Python reference.  Deleting the base unregisters
+and frees its ~sqlite3_vfs~ while the child retains a dangling pointer.
+
+- Direction: carry an explicit APSW base owner independent of excluded methods.
+- Test: derive from a base excluding xAccess, delete it, then use and destroy the
+  child under ASan.
+
+*** C095 [HIGH] ~xSetSystemCall(NULL, ...)~ passes NULL to ~PyUnicode_FromString~
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 1483-1495
+:CATEGORY: NULL dereference / callback bridge
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite permits NULL to reset all system calls and APSW documents ~name=None~.
+The inherited C-to-Python trampoline unconditionally constructs Unicode from
+that NULL pointer.
+
+- Direction: pass ~Py_None~, as the next-system-call bridge already does.
+- Test: through two APSW VFS layers call ~xSetSystemCall(None, 0)~.
+
+*** C096 [MEDIUM] System-call bridge changes valid False/None semantics
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 1491-1528, 1573-1597
+:CATEGORY: API correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The setter ignores its Python result, converting False/unknown into
+~SQLITE_OK~.  The getter rejects documented None/unknown because it accepts only
+integers.
+
+- Direction: require bool for set and map False to ~SQLITE_NOTFOUND~; map None
+  to a NULL function pointer for get.
+- Test: query/set an unknown call through nested VFS layers.
+
+*** C097 [MEDIUM] Inherited short reads discard real trailing NUL bytes
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 2243-2261
+:CATEGORY: data corruption / I/O semantics
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+SQLite zero-fills the unread suffix on short read.  APSW infers actual length by
+stripping all trailing zeroes, which also strips bytes genuinely present at
+EOF.
+
+- Direction: determine available bytes from file size/offset or expose an
+  unambiguous short-read result; do not infer from byte values.
+- Test: read beyond files ending in one or more NUL bytes.
+
+*** C098 [MEDIUM] User-controlled ~mxPathname~ causes signed overflow and invalid sizes
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 578-581, 1053, 1795-1808, 1848-1851
+:CATEGORY: undefined behavior / allocation
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Negative and near-~INT_MAX~ values are accepted.  ~mxPathname + 1~ and
+~512 + mxPathname~ are evaluated as signed int before allocation conversion.
+
+- Direction: validate constructor values and perform checked ~size_t~ arithmetic.
+- Test: negative and INT_MAX values under UBSan.
+
+*** C099 [LOW] Failed VFS ~xOpen~ does not explicitly clear ~pMethods~
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 605-680
+:CATEGORY: SQLite API hardening
+:CONFIDENCE: medium-high
+:STATUS: qualified
+:END:
+
+SQLite's contract requires valid methods on success and NULL on failure.
+Normal SQLite allocation is zeroed, reducing practical exposure, but this
+trampoline returns through many failures without establishing the field for a
+direct/nonstandard caller.
+
+- Direction: set ~pMethods~ and owned file state NULL immediately on entry.
+- Test: invoke through a C shim with nonzero-prefilled storage and forced Python
+  failure.
+
+*** C100 [MEDIUM] Every ~xSync~ callback leaks its flags integer reference
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 2518-2536
+:CATEGORY: reference leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyLong_FromLong(flags)~ is never decref'd on success or failure.
+
+- Direction: decref the argument after vectorcall.
+- Test: force many syncs and assert stable integer refcounts/allocated blocks.
+
+*** C101 [MEDIUM] ~xGetLastError~ truncates every nonempty message by one byte
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 1390-1404
+:CATEGORY: diagnostics / buffer handling
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+The code copies ~len~ bytes then writes NUL at ~len - 1~, replacing the last
+payload byte even with ample output space.
+
+- Direction: reserve one byte, copy at most ~nByte - 1~, terminate at the copied
+  length.
+- Test: return a unique marker and verify every byte survives.
+
+*** C102 [MEDIUM] Optional VFS attribute checks suppress real lookup exceptions
+:PROPERTIES:
+:FILE: src/vfs.c
+:LINES: 998-1000, 1351-1353, 2631-2635
+:CATEGORY: exception handling / new API opportunity
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyObject_HasAttr~ converts descriptor/~__getattribute__~ failures into absence
+(or an unraisable report, depending on Python), and later code may perform a
+second lookup.
+
+- Direction: on Python 3.13+ use ~PyObject_GetOptionalAttr~ or
+  ~PyObject_HasAttrWithError~.  On 3.10-3.12 use ~PyObject_GetAttr~, clear only
+  ~AttributeError~, and call the obtained bound method once.
+- Test: descriptors that raise non-AttributeError and whose result changes on a
+  second lookup.
+
+** src/vtable.c
+
+*** C103 [MEDIUM] BestIndex argument indexes overflow or continue with an exception
+:PROPERTIES:
+:FILE: src/vtable.c
+:LINES: 1496-1500, 1526-1533
+:CATEGORY: undefined behavior / exception state
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Both accepted forms perform ~PyLong_AsInt(value) + 1~ without checking the
+conversion.  ~INT_MAX + 1~ is signed UB; an oversized Python int leaves
+~OverflowError~ pending while planning can continue/return success.  Negative
+indexes are also invalid for SQLite's positive ~argvIndex~.
+
+- Direction: convert to a temporary, check immediately, require
+  ~0 <= value < INT_MAX~, then add one.
+- Test: direct and tuple forms containing -1, INT_MAX, and huge integers under
+  UBSan.
+
+*** C104 [MEDIUM] BestIndex leaks ~idxStr~ and an exceptional ~idxnum~
+:PROPERTIES:
+:FILE: src/vtable.c
+:LINES: 1548-1601
+:CATEGORY: reference leak
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PySequence_GetItem~ returns owned references.  Successful None/string
+~idxStr~ paths never decref it; an overflowing ~idxnum~ jumps away before its
+decref.  Planning repeated uncached statements grows references.
+
+- Direction: one local cleanup path for both values.
+- Test: fresh finalizable string subclasses and oversized index numbers across
+  repeated planning.
+
+*** C105 [MEDIUM] Optional virtual-table method checks suppress descriptor exceptions
+:PROPERTIES:
+:FILE: src/vtable.c
+:LINES: 1069, 1702, 1978, 2083, 2121, 2159, 2198, 2243, 2740
+:CATEGORY: exception handling / new API opportunity
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+~PyObject_HasAttr~ can turn a real lookup error for Savepoint, Rename,
+Integrity, transaction, disconnect, find-function, or shadow-name methods into
+“method absent,” allowing SQLite work to continue incorrectly.
+
+- Direction: use the same versioned optional-attribute helper described in
+  C102 and avoid duplicate lookup.
+- Test: raise ~RuntimeError~ only while looking up each optional method;
+  preserve ordinary ~AttributeError~ absence.
+
+*** C106 [MEDIUM] Several vtable allocation/argument failures violate exception invariants
+:PROPERTIES:
+:FILE: src/vtable.c
+:LINES: 904-918, 1775-1787, 2123-2137, 2161-2176, 2788-2790
+:CATEGORY: exception handling / OOM
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Raw ~PyMem_Calloc~ failures reach handlers that assume an exception, or return
+NULL without one.  Savepoint/Release can fail constructing the level integer
+and still return ~SQLITE_OK~ with an exception pending.
+
+- Direction: set ~PyErr_NoMemory~ immediately and route all argument failures
+  through the callback's SQLite error conversion.
+- Test: fault every listed allocation/construction and require clean
+  ~MemoryError~/SQLite failure, no assertion/SystemError.
+
+*** C107 [LOW] Embedded NUL in BestIndex ~idxStr~ is silently truncated
+:PROPERTIES:
+:FILE: src/vtable.c
+:LINES: 516-536, 1585-1599
+:CATEGORY: API validation / data correctness
+:CONFIDENCE: high
+:STATUS: open
+:END:
+
+Python Unicode can contain NUL, but copying through ~sqlite3_mprintf("%s")~
+stores only the prefix.  SQLite cannot represent NUL in ~idxStr~, so silent
+semantic change is inappropriate.
+
+- Direction: use ~PyUnicode_AsUTF8AndSize~ and reject embedded NUL explicitly.
+- Test: return/assign ~"prefix\0suffix"~ and assert a clear planning exception.
+
+C031 is the sole root report for the related module-registration double free;
+~apswvtabFree~ itself is a normal destructor.
+
+* Consolidated CPython C-API opportunities
+
+These are not additional finding IDs unless tied to a defect above.
+
+1. *PEP 489/per-module state*: multi-phase initialization predates Python 3.10.
+   ~PyType_FromModuleAndSpec~, ~PyType_GetModule~, and
+   ~PyType_GetModuleState~ are available since Python 3.9 and therefore need no
+   fallback at the project's 3.10 floor.  This is the correct foundation for
+   C002 and C044.
+2. *Interpreter capability slots*: ~Py_mod_multiple_interpreters~ was added in
+   Python 3.12; guard with ~PY_VERSION_HEX >= 0x030c0000~ and initially declare
+   unsupported.  ~Py_mod_gil~ was added in 3.13; guard with
+   ~PY_VERSION_HEX >= 0x030d0000~ and continue declaring/using the GIL.  Do not
+   opt into ~Py_MOD_GIL_NOT_USED~ with current object/global synchronization.
+3. *Exception APIs*: ~PyErr_GetRaisedException~ and
+   ~PyErr_SetRaisedException~ were introduced in Python 3.12.  Use them with
+   ~PyException_SetContext~ to replace private chaining APIs; retain a
+   fetch/normalize/restore fallback on 3.10-3.11 (C067).
+4. *Optional attributes*: ~PyObject_GetOptionalAttr~ and
+   ~PyObject_HasAttrWithError~ were introduced in Python 3.13.  Use a
+   ~PyObject_GetAttr~ fallback that clears only ~AttributeError~ on 3.10-3.12
+   (C102/C105).
+5. *Unicode keyword comparison*: ~PyUnicode_EqualToUTF8~ was introduced in
+   Python 3.13.  Use a length-aware UTF-8 fallback on 3.10-3.12 (C006).
+6. *Strong item references*: ~PyList_GetItemRef~ and ~PyDict_GetItemRef~ were
+   introduced in Python 3.13.  They can harden future no-GIL code but are not a
+   substitute for object-level locks.  A checked dict plus ~Py_NewRef~ remains
+   the 3.10-3.12 GIL-protected fallback (C068).
+7. *Managed weakrefs*: ~Py_TPFLAGS_MANAGED_WEAKREF~ was introduced in Python
+   3.12.  It is optional layout cleanup, not a current correctness fix.
+8. *Public allocation APIs*: replacing private ~_PyObject_New~ and
+   ~_PyObject_NewVar~ with public allocation/type slots is desirable source
+   hygiene, but no allocator mismatch was validated in the reviewed sites.
+
+* Rejected or consolidated candidates
+
+- The proposed concurrent logger replacement UAF was rejected as an
+  unconditional defect: reproducing it requires calling ~sqlite3_config~ while
+  another SQLite API/log callback is active, contrary to SQLite's global
+  quiescence contract.  APSW may still document or defensively enforce that
+  precondition.
+- Current free-threaded races premised on ~Py_MOD_GIL_NOT_USED~ were not logged
+  as active defects.  APSW currently causes free-threaded CPython to retain the
+  GIL.  They remain blockers to a future no-GIL declaration.
+- Repeated process-global findings in stringconstants, async caches, pending
+  calls, and static types were consolidated into C002.
+- The Unicode offset and VLA issues are rooted in argparse/common macros and are
+  not duplicated at every sink.
+- The Blob weakref leak is rooted in ~src/connection.c~ (C032), not
+  ~src/blob.c~.
+- The virtual-table registration double free is rooted in
+  ~src/connection.c~ (C031), not the normal destructor in ~src/vtable.c~.
+- Private allocator/tuple-resize use was not treated as a current correctness
+  bug where ownership and matching free paths were valid.
+- Interning every generated string constant was rejected as speculative without
+  profile/benchmark evidence.
+
+* Per-file coverage
+
+- ~src/apsw.c~: C001-C003.
+- ~src/argparse.c~: C004-C008.
+- ~src/async.c~: C009-C012.
+- ~src/backup.c~: C013-C014.
+- ~src/blob.c~: C015-C021.
+- ~src/carray.c~: C022-C029.
+- ~src/connection.c~: C030-C036.
+- ~src/constants.c~: C037 (generated; fix generator).
+- ~src/cursor.c~: C038-C043.
+- ~src/exceptions.c~: C044-C046.
+- ~src/faultinject.c~: C047-C052 (fault-injection builds only).
+- ~src/fileio_win32.c~: C053 (Windows fileio extension only).
+- ~src/fts.c~: C054-C059.
+- ~src/jsonb.c~: C060-C065.
+- ~src/pyutil.c~: C066-C068.
+- ~src/session.c~: C069-C076.
+- ~src/statementcache.c~: C077-C081.
+- ~src/stringconstants.c~: no independent finding; generated evidence for C002.
+- ~src/testextension.c~: C082-C083 (test extension only).
+- ~src/traceback.c~: no actionable findings.
+- ~src/unicode.c~: C084-C090; sinks/duplicates for C004, C005, C007.
+- ~src/util.c~: C091-C093; common definitions/evidence for C002 and C007.
+- ~src/vfs.c~: C094-C102.
+- ~src/vtable.c~: C103-C107; destructor evidence for C031.
+- ~src/_unicodedb.c~: intentionally skipped as generated.
