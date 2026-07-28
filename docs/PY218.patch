@@ -1,0 +1,8 @@
+# PY218: Installed-wheel validation can import the in-tree extension
+#
+# CONFIRMED — static analysis (test artifact validation)
+#
+# megatest.py:60-73 builds APSW in place (build_ext --inplace), then builds and
+# installs a wheel, but runs python -m apsw.tests with cd {workdir} pointing
+# at the source checkout. Python can resolve the in-tree extension before the
+# venv's installed wheel. Broken wheel contents can pass the post-install test.

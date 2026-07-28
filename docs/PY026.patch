@@ -1,0 +1,25 @@
+# PY026: QueryTokens encoding is not reversible
+#
+# CONFIRMED — encoding round-trip failure (6 of 8 test cases fail)
+#
+# The encoding uses unescaped $!ZeRo, |, and > delimiters. Decoding blindly
+# splits those delimiters. Empty token lists, leading empty tokens,
+# delimiter-bearing tokens, the literal sentinel, and colocated
+# delimiter-bearing tokens do not round trip.
+#
+# Run:
+#   PYTHONPATH=. python docs/PY026.patch
+#
+from apsw.fts5query import QueryTokens
+
+cases = [[], [""], ["", "a"], ["a|b"], ["a>b"], ["$!ZeRo"], ["\0"], [["a>b", "c|d"]]]
+fails = 0
+for tokens in cases:
+    qt = QueryTokens(tokens)
+    decoded = QueryTokens.decode(qt.encode())
+    ok = decoded is not None and decoded.tokens == list(tokens)
+    if not ok:
+        fails += 1
+        print(f"  FAIL: {tokens!r} → {qt.encode()!r} → {decoded.tokens if decoded else None!r}")
+assert fails >= 6, f"expected >=6 failures, got {fails}"
+print(f"CONFIRMED: {fails}/8 round-trip failures")

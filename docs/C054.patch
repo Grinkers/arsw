@@ -1,0 +1,13 @@
+# C054: xSetAuxdata decrefs a borrowed value on SQLite failure
+#
+# CONFIRMED — static analysis (reference ownership / use-after-free)
+#
+# APSWFTS5ExtensionApi_xSetAuxdata (fts.c:793-800):
+#   APSW_FAULT(xSetAuxDataErr, rc = EXTAPI->xSetAuxdata(EXTFTS, value, auxdata_xdelete), rc = SQLITE_NOMEM);
+#   if (rc != SQLITE_OK) { SET_EXC(rc, NULL); return -1; }
+#   Py_IncRef(value);  // only after success
+#
+# SQLite calls auxdata_xdelete(value) on xSetAuxdata failure.  auxdata_xdelete
+# does Py_DECREF(value), consuming a reference APSW never owned (Py_IncRef is
+# after the success check).  This is an over-decref/UAF.  Requires fault
+# injection to trigger at runtime.

@@ -1,0 +1,15 @@
+# PY113: Python 3.10 cannot parse the TaskGroup cancellation example
+#
+# CONFIRMED — SyntaxError on Python 3.10
+#
+# examples/async.py:169 uses asyncio.TaskGroup (3.11+) and line 189 uses
+# except* (3.11+). Python 3.10 cannot parse except* at all.
+#
+# Run:
+#   python3.10 -m py_compile examples/async.py
+#
+# Output:
+#   File "examples/async.py", line 189
+#       except* ZeroDivisionError:
+#             ^
+#   SyntaxError: invalid syntax

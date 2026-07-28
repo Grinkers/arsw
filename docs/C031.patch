@@ -1,0 +1,43 @@
+# C031: Virtual-table registration has double-free and pre-transfer leaks
+#
+# CONFIRMED — pre-transfer reference leak (reproduced)
+#              + double-free on OOM (confirmed by static analysis of code path)
+#
+# Part 1 (reproduced): datasource is Py_INCREF'd before vti is fully set up.
+# If apswvtabSetupModuleDef fails (e.g. iVersion=5), goto error calls
+# apswvtabFree(vti), but vti->datasource was never assigned (still 0 from
+# PyMem_Calloc), so Py_XDECREF(0) is a no-op and the incref'd datasource ref
+# leaks permanently.
+#
+# Part 2 (static): if sqlite3_create_module_v2 fails AND calls apswvtabFree
+# (SQLite OOM in sqlite3VtabCreateModule), APSW's error path calls apswvtabFree
+# again — double free.  Needs fault injection to trigger at runtime.
+#
+# Run:
+#   PYTHONPATH=. python docs/C031.patch
+#
+import apsw, gc, weakref
+
+con = apsw.Connection("")
+
+
+class MyDataSource:
+    pass
+
+
+ds = MyDataSource()
+ds_ref = weakref.ref(ds)
+
+# iVersion=5 makes apswvtabSetupModuleDef return NULL → goto error
+try:
+    con.create_module("testmod", ds, iVersion=5)
+except ValueError as e:
+    print(f"Registration failed (expected): {e}")
+
+del ds
+gc.collect()
+
+if ds_ref() is not None:
+    print(f"LEAKED: datasource still alive after del + gc.collect()")
+else:
+    print("No leak (unexpected)")

@@ -1,0 +1,15 @@
+# C024: Writable carray buffers race SQLite scans executed without the GIL
+#
+# CONFIRMED — static analysis (data race)
+#
+# A buffer export (PyObject_GetBuffer with PyBUF_ANY_CONTIGUOUS) pins lifetime
+# and shape, not bytes.  carray passes the raw buffer pointer to SQLite, which
+# reads it during sqlite3_step with the GIL released (Py_BEGIN_ALLOW_THREADS in
+# cursor.c:1054-1057).  Another Python thread holding the GIL can mutate the
+# underlying bytearray, array, writable memoryview, or NumPy array concurrently,
+# producing a native data race.
+#
+# On x86_64, aligned int64/int32 writes are architecturally atomic, so torn
+# values were not observed in 500+ trials.  The race is still undefined
+# behavior in C and would produce torn values on weaker architectures or with
+# misaligned buffers (C022).  TSan flags it immediately.

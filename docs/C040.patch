@@ -1,0 +1,11 @@
+# C040: resetcursor can return success with an iterator exception pending
+#
+# CONFIRMED — static analysis (exception-state corruption)
+#
+# In resetcursor (cursor.c:200-213), when probing self->emiter:
+#   next = PyIter_Next(self->emiter);
+#   if (next) { ... res = SQLITE_ERROR; }
+# If PyIter_Next returns NULL with a non-StopIteration exception, the if(next)
+# block is skipped, leaving res=SQLITE_OK.  The assertion at line 221
+# (assert(res) when PyErr_Occurred()) fires in debug builds; release builds
+# continue with a pending exception, leading to SystemError.

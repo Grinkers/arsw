@@ -1,0 +1,14 @@
+# C044: Exception-class globals are dangling borrowed pointers after attribute replacement
+#
+# CONFIRMED — static analysis (use-after-free / reference ownership)
+#
+# Most exception classes are added with PyModule_AddObject (steals ref), leaving
+# process-global C pointers (exc_descriptors[i].cls, ExcConnectionClosed, etc.)
+# that do not own a reference.  Users can replace/delete module attributes,
+# dropping the last strong reference.  C code then passes the stale pointer to
+# exception APIs.  APSWException uses PyModule_AddObjectRef (owned) and is not
+# affected the same way.
+#
+# Runtime testing showed refcount=5 for TooBigError (from module dict, type
+# hierarchy, etc.) so replacing the attribute alone didn't free it, but the C
+# pointer remains unowned/borrowed.

@@ -1,0 +1,9 @@
+# PY046: --data-size makes compared workloads unequal and run-order-dependent
+#
+# CONFIRMED — static analysis (benchmark correctness)
+#
+# With --data-size, number_name() (speedtest.py:131-135) consumes global random
+# state via random.randint(). Bindings SQL invokes it during execution while
+# no-bindings SQL invokes it during generation. Reused binding workloads
+# generate different data across drivers and iterations from mutable seeded
+# state. Alternating driver order changes which driver consumes each portion.

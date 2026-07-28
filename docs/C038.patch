@@ -1,0 +1,28 @@
+# C038: Cursor mutex wait races close and can dereference NULL or retain a mutex
+#
+# CONFIRMED — static analysis (data race / NULL dereference / mutex leak)
+#
+# cursor_mutex_get (src/cursor.c:594-669) releases the GIL during the retry
+# loop and reads self->connection->dbmutex without a local copy:
+#
+#   Py_BEGIN_ALLOW_THREADS
+#   {
+#       waited += sqlite3_sleep(delays[attempt]);
+#       res = sqlite3_mutex_try(self->connection->dbmutex);  // NULL deref risk
+#   }
+#   Py_END_ALLOW_THREADS;
+#
+#   checks:
+#       if (!self->connection)   // checked AFTER the dereference above
+#
+# Another thread can close the cursor (APSWCursor_close_internal calls
+# Py_CLEAR(self->connection) at line 280) during the sqlite3_sleep window,
+# causing self->connection to be NULL when sqlite3_mutex_try dereferences it.
+#
+# A second interleaving: the waiter acquires the OLD mutex, then observes the
+# cleared connection at `checks:`, takes the error path, but the error path
+# checks `if (self->connection)` before releasing — so the mutex is never
+# released (permanent retention).
+#
+# Runtime repro on x86 did not crash in 200 trials (the race window during
+# sqlite3_sleep is narrow).  The code path is unambiguous.

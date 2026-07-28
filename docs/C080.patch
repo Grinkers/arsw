@@ -1,0 +1,9 @@
+# C080: Valid hash -1 collides with the empty-slot sentinel on 32-bit
+#
+# CONFIRMED — static analysis (NULL dereference / portability, 32-bit only)
+#
+# The DJB2 hash is narrowed to Py_hash_t (statementcache.c:84-85).  On 32-bit,
+# 0xffffffff becomes -1, the initialized empty marker.  Lookup compares hash
+# before checking the cache pointer and dereferences NULL (statementcache.c:166-220).
+# Valid SQL strings can produce that hash.  Not reproducible on 64-bit where
+# Py_hash_t is 64-bit.

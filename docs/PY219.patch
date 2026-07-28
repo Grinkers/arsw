@@ -1,0 +1,8 @@
+# PY219: Worker failures are reported but do not fail megatest
+#
+# CONFIRMED — static analysis (test failure propagation)
+#
+# megatest.py:148-156 catches exceptions from completed futures and prints
+# "FAIL", but no failure state is retained or returned. main() returns normally
+# after all jobs finish, so all matrix jobs can fail while the process exits
+# with status zero.

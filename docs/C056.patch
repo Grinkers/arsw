@@ -1,0 +1,26 @@
+# C056: Replacing SQL function fts5 can cause a NULL API dereference
+#
+# CONFIRMED — crash (SIGSEGV, NULL dereference)
+#
+# Connection_fts5_api queries "select fts5(?1)" and treats any SQLITE_ROW as
+# success.  Registering a scalar function named "fts5" makes the query return a
+# row, but the fts5_api pointer remains NULL.  The code then dereferences
+# api->iVersion on a NULL pointer.
+#
+# GDB backtrace:
+#   SIGSEGV at Connection_fts5_api src/fts.c:33  (api->iVersion, api=NULL)
+#   #0 Connection_fts5_api
+#   #1 Connection_fts5_tokenizer src/connection.c:6498
+#
+# Run:
+#   PYTHONPATH=. python docs/C056.patch
+#
+import apsw
+
+con = apsw.Connection("")
+
+# Shadow the FTS5 API lookup query with a scalar function
+con.create_scalar_function("fts5", lambda x: None, 1)
+
+# fts5_tokenizer calls Connection_fts5_api() → NULL deref
+con.fts5_tokenizer("simple")

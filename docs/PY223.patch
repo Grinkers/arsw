@@ -1,0 +1,8 @@
+# PY223: Legacy-name test failures do not affect process status
+#
+# CONFIRMED — static analysis (test failure propagation)
+#
+# tools/names.py:102 calls unittest.TextTestRunner().run(...) and discards the
+# returned TestResult. run-tests returns successfully even when transformed
+# old-name tests fail. The make test recipe invokes this command and can
+# succeed despite a failed compatibility test pass.

@@ -1,0 +1,9 @@
+# PY210: Generated JSON is decoded only for a discarded validation result
+#
+# CONFIRMED — static analysis (benchmark correctness)
+#
+# tools/json_bench.py:51 evaluates [json.loads(i) for i in items] but discards
+# the parsed objects, then extends data with the original JSON strings (line
+# 56). big_data therefore contains JSON strings rather than nested Python
+# objects. The benchmark measures encoding/escaping of text strings, not
+# nested-object traversal.

@@ -1,0 +1,9 @@
+# C069: ChangesetIterator keeps a dangling borrowed TableChange pointer
+#
+# CONFIRMED — static analysis (use-after-free / lifetime)
+#
+# last_table_change is not an owned reference (session.c:230-238).  Dropping the
+# returned object before the next iteration leaves a pointer the iterator writes
+# through.  Conversely, destroying the iterator finalizes SQLite state without
+# invalidating a surviving TableChange, whose properties then use freed iterator
+# and table-name storage.

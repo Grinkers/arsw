@@ -1,0 +1,21 @@
+# C013: Progress getters race with step and finish
+#
+# CONFIRMED — static analysis (data race / use-after-free)
+#
+# step() and finish() run with the GIL released (Py_BEGIN_ALLOW_THREADS around
+# sqlite3_backup_step/finish).  The remaining/page_count getters call
+# sqlite3_backup_remaining/pagecount on self->backup WITHOUT acquiring either
+# database mutex:
+#
+#   static PyObject *
+#   APSWBackup_get_remaining(...) {
+#       return PyLong_FromLong(self->backup ? sqlite3_backup_remaining(self->backup) : 0);
+#   }
+#
+# Concurrent step violates SQLite's getter contract (reading progress while
+# step is modifying the backup state).  Concurrent finish can free the handle
+# (close_internal sets self->backup = 0) while a getter reads it — a classic
+# TOCTOU/use-after-free.
+#
+# Runtime repro on x86 did not crash in limited testing (strong memory ordering
+# makes the race window very small).  TSan would flag this immediately.

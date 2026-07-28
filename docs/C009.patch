@@ -1,0 +1,21 @@
+# C009: Re-entrant BoxedCall clears an outer invocation's live state
+#
+# CONFIRMED — static analysis (re-entrancy use-after-free / state corruption)
+#
+# BoxedCall_internal_call does not guard against re-entrancy:
+#
+#   if (0 == PyContext_Enter(self->context)) {
+#       // ... execute the call ...
+#       PyContext_Exit(self->context);
+#   }
+#   // falls through REGARDLESS of whether Enter succeeded
+#   BoxedCall_clear(self);   // clears context + args, sets Dormant
+#
+# If re-entered during execution (e.g. through apsw.aio._tls.current_call.call
+# or an argument __del__ triggered by the decrefs in BoxedCall_clear before
+# call_type is set to Dormant), the recursive call clears the outer invocation's
+# context and arguments.  The outer call then operates on cleared/freed state
+# (PyContext_Exit on a Py_CLEAR'd context pointer).
+#
+# Runtime repro requires the full apsw.aio async machinery to arrange
+# re-entrancy during a BoxedCall; the code path is unambiguous.

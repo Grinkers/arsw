@@ -1,0 +1,9 @@
+# C094: Derived VFS can outlive an unretained APSW base
+#
+# CONFIRMED — static analysis (use-after-free / ownership)
+#
+# APSW detects whether a base is an APSW object by comparing only xAccess with
+# the APSW trampoline (vfs.c:1732-1734).  A base created with exclude={"xAccess"}
+# has NULL there, so the child takes no strong Python reference.  Deleting the
+# base unregisters and frees its sqlite3_vfs while the child retains a dangling
+# pointer.

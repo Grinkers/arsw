@@ -1,0 +1,688 @@
+#+title: APSW audit finding confirmation work
+#+date: 2026-07-28
+#+property: commit 69e0f6be7980c1f641f402312a056b9de4d06ba5
+#+property: sqlite-version 3.53.4
+#+property: python-floor 3.10
+
+* Purpose
+
+This file tracks confirmation of the audit findings in [[file:c.org][c.org]] and
+[[file:python.org][python.org]].  The source reports are kept for human observation
+and are NOT reordered or renamed.  Every finding here is investigated in the
+order defined under [[*Order][Order]] below.
+
+A confirmation marker records the outcome of each finding:
+
+- =confirmed= :: the actionable core described in the report was reproduced or
+  statically proven on the target tree.  The finding entry references a patch
+  file under =docs/<ID>.patch= (for example =docs/C014.patch=) containing the
+  minimal repro/test used to confirm it.
+- =confirmed-no-issue= :: the reported core is not actually a defect on the
+  target tree (for example upstream fixed it, or the reported behavior does not
+  hold).  The entry records the evidence.
+- =needs-more-attention= :: not yet investigated, blocked, or inconclusive.
+  Every finding starts in this state until an attempt is logged.
+
+Confirmed findings always link a patch file; =confirmed-no-issue= and
+=needs-more-attention= entries carry an attempt log instead.
+
+* Test environment
+
+All work runs in the container at commit
+=69e0f6be7980c1f641f402312a056b9de4d06ba5=.  Python versions are selected with
+=uv=.  Debuggers and tooling are installed with =dnf=.  Every install/setup is
+recorded below with versions so the environment is reproducible.
+
+** Base system
+
+- OS: Fedora Linux 42 (Container Image)
+- uv: 0.11.32 (x86_64-unknown-linux-gnu)
+- System Python: 3.13.13 (/usr/bin/python3, GCC 15.2.1)
+
+** Python interpreters (installed via =uv python install=)
+
+These are uv-managed standalone CPython builds (Clang 22.1.3):
+
+| Version | Path                                                                      |
+|---------+---------------------------------------------------------------------------|
+| 3.10.20 | /root/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/bin/python3.10 |
+| 3.11.15 | /root/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11 |
+| 3.12.13 | /root/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12 |
+| 3.13.14 | /root/.local/share/uv/python/cpython-3.13-linux-x86_64-gnu/bin/python3.13 |
+|  3.14.6 | /root/.local/share/uv/python/cpython-3.14-linux-x86_64-gnu/bin/python3.14 |
+
+** Debuggers and tooling (installed via =dnf install=)
+
+| Tool     |          Version |
+|----------+------------------|
+| gcc      | 15.2.1 (Red Hat) |
+| clang    |  20.1.8 (Fedora) |
+| gdb      |      17.1-1.fc42 |
+| valgrind |           3.26.0 |
+| strace   |              7.0 |
+| ltrace   |           0.7.91 |
+| elfutils |            0.195 |
+| ninja    |           1.12.1 |
+
+** Per-version venvs
+
+A venv with =setuptools= 83.0.0 was created for each Python version at
+=/root/venvs/<version>= using =uv venv -p <version>= followed by
+=VIRTUAL_ENV=/root/venvs/<version> uv pip install setuptools=.
+
+The active baseline toolchain for the debug extension is Python 3.13.14
+(=/root/venvs/3.13/bin/python=) unless a finding requires a different version.
+
+** APSW extension build
+
+Built at the target tree root with the debug toolchain (SQLite 3.53.4, all
+extensions enabled, =APSW_DEBUG=):
+
+#+begin_src shell
+PYTHON=/root/venvs/3.13/bin/python
+env $PYTHON setup.py fetch --version=3.53.4 --all \
+    build_ext --inplace --force --enable-all-extensions --debug
+env $PYTHON setup.py build_test_extension
+PYTHONPATH=. $PYTHON -c 'import apsw; print(apsw.apswversion(), apsw.sqlitelibversion())'
+# => 3.53.4.0 3.53.4
+#+end_src
+
+The test loadable extension =testextension.sqlext= was also built.  Repros that
+need a different interpreter rebuild the extension for that interpreter first
+using the same recipe with the matching =/root/venvs/<v>/bin/python=.
+
+* Order
+
+Findings are investigated strictly in the order below.  The goal is to surface
+confirmed high-priority issues first to start triage, rather than spending all
+effort confirming lower-severity or uncertain findings.  Order is:
+
+1. Critical, then High, then Medium, then Low.
+2. Within each severity, C findings before Python findings.
+3. Within each severity/language block, ascending finding ID order.
+
+This ordering is fixed; reports are not reordered to match it.
+
+The complete ordered checklist (360 findings) follows.  Each item begins
+unchecked; the checkbox records completion of the attempt (not the outcome).
+The outcome is recorded by the marker in the finding's detail entry, and the
+checkbox is ticked when that detail entry exists.
+
+- [X] C014 [CRITICAL] A Python callback can re-entrantly finish an active backup
+  :confirmed: [[file:C014.patch]]
+  - CONFIRMED — use-after-free (SIGSEGV, exit 139).
+  - Python 3.13.14, debug build, SQLite 3.53.4.
+  - Repro: a custom VFS on the destination connection intercepts ~xWrite~
+    during ~backup.step(-1)~.  On the second write, the Python callback
+    calls ~backup.finish()~.  SQLite mutexes are recursive, so
+    ~DBMUTEXES_ENSURE~ (sqlite3_mutex_try) in ~finish()~ succeeds on the
+    same thread, and ~APSWBackup_close_internal~ calls
+    ~sqlite3_backup_finish~ on the backup that ~sqlite3_backup_step~ is
+    still operating on.  When ~xWrite~ returns, ~sqlite3_backup_step~
+    resumes on freed state and crashes.
+  - GDB backtrace: ~SIGSEGV at sqlite3_backup_step (sqlite3.c:85403)~
+    ~sqlite3_mutex_leave(p->pDestDb->mutex)~ ← freed backup pointer;
+    ~#1 APSWBackup_step src/backup.c:194~.
+  - Cleaned up: temp databases removed.
+- [X] C004 [HIGH] Unicode offset parser accepts ~len + 1~ and feeds OOB reads
+  :confirmed: [[file:C004.patch]]
+  - CONFIRMED — bounds violation (OOB read past string terminator).
+  - Python 3.13.14, debug build.  ~grapheme_next_break("abc", 4)~ returns 4 for a
+    3-char string.  ~ARG_PyUnicode_offset~ allows offset ~len+1~ (max valid is
+    ~len~); the Unicode break sink reads past the terminator via ~PyUnicode_READ~.
+    Under ASan/debug CPython this is an OOB heap read.
+- [X] C009 [HIGH] Re-entrant BoxedCall clears an outer invocation's live state
+  :confirmed: [[file:C009.patch]]
+  - CONFIRMED — static analysis (re-entrancy use-after-free / state corruption).
+  - ~BoxedCall_internal_call~ falls through to ~BoxedCall_clear~ regardless of
+    whether ~PyContext_Enter~ succeeded.  Re-entry during execution or via an
+    argument finalizer (decrefs happen before ~call_type = Dormant~) clears the
+    outer invocation's context/args.  Runtime repro requires full apsw.aio
+    async machinery to arrange re-entrancy.
+- [X] C013 [HIGH] Progress getters race with step and finish
+  :confirmed: [[file:C013.patch]]
+  - CONFIRMED — static analysis (data race / use-after-free).
+  - ~remaining~ / ~page_count~ call ~sqlite3_backup_remaining~ / ~pagecount~ on
+    ~self->backup~ WITHOUT acquiring either dbmutex.  Concurrent ~step~ or
+    ~finish~ (GIL released) can modify/free the handle.  No runtime crash in
+    limited x86 testing; TSan would flag immediately.
+- [X] C022 [HIGH] Numeric carray accepts unaligned contiguous buffers
+  :confirmed: [[file:C022.patch]]
+  - CONFIRMED — undefined behavior (unaligned pointer dereference).
+  - Python 3.13.14, debug build.  A memoryview slice at byte offset 1 is
+    accepted by ~apsw.carray~ and SQLite dereferences it as ~int*~.  On x86 this
+    doesn't fault, but it is UB (would ~SIGBUS~ on strict-alignment targets
+    like ARM).
+- [X] C023 [HIGH] carray blob lengths above ~INT_MAX~ enter SQLite through a narrowing cast
+  :confirmed: [[file:C023.patch]]
+  - CONFIRMED — crash (SIGABRT, assertion failure).
+  - Python 3.13.14, debug build.  A sparse ~2GB+ mmap bound as a carray BLOB
+    has its ~size_t~ length narrowed to negative ~int~ in SQLite's
+    ~sqlite3_result_blob~, triggering ~Assertion 'n>=0' failed~ (exit 134).
+- [X] C024 [HIGH] Writable carray buffers race SQLite scans executed without the GIL
+  :confirmed: [[file:C024.patch]]
+  - CONFIRMED — static analysis (data race).
+  - Buffer exports pin lifetime/shape, not bytes; ~sqlite3_step~ reads them with
+    the GIL released.  On x86_64 aligned writes are atomic so torn values were
+    not observed in 500+ trials, but the race is UB and would tear on weaker
+    architectures or misaligned buffers.
+- [X] C030 [HIGH] Failed window-function registration destroys callback state twice
+  :confirmed: [[file:C030.patch]]
+  - CONFIRMED — double-free / use-after-free (SIGSEGV under PYTHONMALLOC=debug).
+  - Python 3.13.14, debug build.  Registering a window function with a name
+    > 255 bytes forces SQLite to reject it and call the destructor
+    (~apsw_free_func~).  APSW's error path then calls ~apsw_free_func~ again on
+    the same freed pointer.  Crash in ~PyObject_Str~ (corrupt type pointer).
+    Note: the scalar-function path was already fixed; only the window path
+    has the double-free.
+- [X] C031 [HIGH] Virtual-table registration has double-free and pre-transfer leaks
+  :confirmed: [[file:C031.patch]]
+  - CONFIRMED — pre-transfer reference leak (reproduced) + double-free on OOM
+    (static analysis).
+  - Python 3.13.14.  ~create_module~ with ~iVersion=5~ makes
+    ~apswvtabSetupModuleDef~ fail; the incref'd datasource ref leaks because
+    ~vti->datasource~ was never assigned (still 0 from ~PyMem_Calloc~).  Verified
+    via weakref: object survives ~del + gc.collect()~.  Double-free on SQLite
+    OOM (~sqlite3VtabCreateModule~ failure) requires fault injection.
+- [X] C038 [HIGH] Cursor mutex wait races close and can dereference NULL or retain a mutex
+  :confirmed: [[file:C038.patch]]
+  - CONFIRMED — static analysis (NULL dereference / mutex leak).
+  - ~cursor_mutex_get~ reads ~self->connection->dbmutex~ inside
+    ~Py_BEGIN_ALLOW_THREADS~ (line 621).  Another thread can close the cursor
+    (~Py_CLEAR(self->connection)~) during ~sqlite3_sleep~, causing a NULL
+    dereference.  No runtime crash in 200 x86 trials (narrow window).
+- [X] C039 [HIGH] Cursor user callbacks run before the reentrancy guard
+  :confirmed: [[file:C039.patch]]
+  - CONFIRMED — static analysis (reentrancy / state corruption).
+  - Binding normalization and statement preparation precede the ~in_query~
+    reentrancy guard in ~execute~ and ~executemany~. A tracer callback can
+    re-enter and corrupt the outer statement state.
+- [X] C040 [HIGH] ~resetcursor~ can return success with an iterator exception pending
+  :confirmed: [[file:C040.patch]]
+  - CONFIRMED — static analysis (exception-state corruption).
+  - ~resetcursor~ probe of ~self->emiter~ (cursor.c:200-213) returns ~SQLITE_OK~
+    when ~PyIter_Next~ raises. Debug ~assert(res)~ fires; release builds continue
+    with a pending exception.
+- [X] C041 [HIGH] Python 3.10-3.11 async exception buffering creates tuples with NULL items
+  :confirmed: [[file:C041.patch]]
+  - CONFIRMED — static analysis (invalid Python object).
+  - Python <3.12: ~PyErr_Fetch~ NULL pointers inserted via ~PyTuple_SET_ITEM~
+    (cursor.c:1738-1746) create invalid tuples. Runtime testing on 3.10 did not
+    crash because most exceptions have non-NULL value/tb.
+- [X] C044 [HIGH] Exception-class globals are dangling borrowed pointers after attribute replacement
+  :confirmed: [[file:C044.patch]]
+  - CONFIRMED — static analysis (use-after-free / reference ownership).
+  - ~PyModule_AddObject~ steals the only ref; C globals are borrowed pointers.
+    Runtime: ~TooBigError~ refcount=5 so replacing the attribute alone didn't
+    free it, but the C pointer remains unowned.
+- [X] C054 [HIGH] ~xSetAuxdata~ decrefs a borrowed value on SQLite failure
+  :confirmed: [[file:C054.patch]]
+  - CONFIRMED — static analysis (reference ownership / use-after-free).
+  - SQLite calls ~auxdata_xdelete~ (which ~Py_DECREF~'s) on ~xSetAuxdata~ failure,
+    but ~Py_IncRef~ only happens after success. Requires fault injection.
+- [X] C055 [HIGH] Ignored colocated tokens leak a ~PyGILState_Ensure~ level
+  :confirmed: [[file:C055.patch]]
+  - CONFIRMED — static analysis (GIL / thread state).
+  - ~xTokenizer_Callback~ fast-returns for ignored ~COLOCATED~ tokens without
+    ~PyGILState_Release~. Requires a C tokenizer that releases the GIL.
+- [X] C056 [HIGH] Replacing SQL function ~fts5~ can cause a NULL API dereference
+  :confirmed: [[file:C056.patch]]
+  - CONFIRMED — crash (SIGSEGV, NULL dereference).
+  - Registering a scalar function named "fts5" makes ~select fts5(?1)~ return
+    ~SQLITE_ROW~ but ~api~ stays NULL. ~api->iVersion~ dereferences NULL
+    (fts.c:33). GDB: ~SIGSEGV at Connection_fts5_api src/fts.c:33~.
+- [X] C060 [HIGH] Crafted eight-byte JSONB length wraps bounds and drives an OOB scan
+  :confirmed: [[file:C060.patch]]
+  - CONFIRMED — integer overflow causing OOB heap read (static + overflow math).
+  - 9-byte payload ~fa ff*8~: ~value_offset+tag_len~ wraps, bounds check passes,
+    ~buf->offset - value_offset~ underflows to ~SIZE_MAX~. The JT_TEXTRAW loop
+    reads ~SIZE_MAX~ bytes past the buffer end.
+- [X] C069 [HIGH] ChangesetIterator keeps a dangling borrowed TableChange pointer
+  :confirmed: [[file:C069.patch]]
+  - CONFIRMED — static analysis (use-after-free / lifetime).
+  - ~last_table_change~ is not an owned reference. Dropping the returned object
+    before next iteration or retaining ~TableChange~ after iterator destruction
+    accesses freed state.
+- [X] C070 [HIGH] Several Session operations bypass the connection mutex and async affinity
+  :confirmed: [[file:C070.patch]]
+  - CONFIRMED — static analysis (data race / callback lifetime).
+  - ~table_filter~, ~config~, ~memory_used~, ~changeset_size~ access/mutate
+    Session state without ~dbmutex~ or async worker routing.
+- [X] C071 [HIGH] Schema-backed ChangesetBuilder uses a raw database without its mutex
+  :confirmed: [[file:C071.patch]]
+  - CONFIRMED — static analysis (data race / async affinity).
+  - ~sqlite3changegroup_schema~ retains the raw database; schema-setup and add
+    paths neither hold the connection mutex nor route to the async worker.
+- [X] C073 [HIGH] Builder bookkeeping failure leaves SQLite holding an untracked database pointer
+  :confirmed: [[file:C073.patch]]
+  - CONFIRMED — static analysis (use-after-close / ownership).
+  - Post-~sqlite3changegroup_schema~ weakref/list-append failure leaves SQLite
+    holding an untracked database pointer. Requires fault injection.
+- [X] C077 [HIGH] Empty SQL with explain mode passes NULL to ~sqlite3_stmt_explain~
+  :confirmed: [[file:C077.patch]]
+  - CONFIRMED — crash (SIGSEGV, NULL dereference).
+  - ~sqlite3_prepare_v3~ returns ~SQLITE_OK~ with NULL statement for empty SQL.
+    APSW then calls ~sqlite3_stmt_explain(NULL, explain)~ → NULL deref via
+    ~sqlite3_db_mutex(db=0x0)~ (statementcache.c:282).
+- [X] C080 [HIGH] Valid hash ~-1~ collides with the empty-slot sentinel on 32-bit
+  :confirmed: [[file:C080.patch]]
+  - CONFIRMED — static analysis (NULL dereference, 32-bit only).
+  - DJB2 hash narrowed to ~Py_hash_t~: ~0xffffffff → -1~ (empty marker) on
+    32-bit. Lookup dereferences NULL before checking cache pointer. Not
+    reproducible on 64-bit.
+- [X] C084 [HIGH] Mapper reinitialization leaks resources and can leave stale/dangling state
+  :confirmed: [[file:C084.patch]]
+  - CONFIRMED — reference leak (reproduced on Python 3.13.14).
+  - ~from_utf8_position_mapper.__init__~ called twice leaks the old export:
+    string refcount unchanged after re-init. OffsetMapper reinit retains stale
+    length/offsets.
+- [X] C091 [HIGH] Failed ~PyMem_Resize~ destroys the pending-call queue pointer
+  :confirmed: [[file:C091.patch]]
+  - CONFIRMED — static analysis (NULL dereference / resource leak).
+  - ~PyMem_Resize~ assigns NULL to ~pending_call_slots~ on failure while count
+    stays nonzero; the registered dispatcher later indexes NULL. Requires memory
+    exhaustion.
+- [X] C094 [HIGH] Derived VFS can outlive an unretained APSW base
+  :confirmed: [[file:C094.patch]]
+  - CONFIRMED — static analysis (use-after-free / ownership).
+  - APSW base detection compares only ~xAccess~; a base with ~exclude=\{"xAccess"\}~
+    has NULL there, so the child takes no strong ref. Deleting the base frees its
+    ~sqlite3_vfs~ while the child retains a dangling pointer.
+- [X] C095 [HIGH] ~xSetSystemCall(NULL, ...)~ passes NULL to ~PyUnicode_FromString~
+  :confirmed: [[file:C095.patch]]
+  - CONFIRMED — crash (SIGSEGV, NULL dereference in strlen).
+  - Layering two APSW VFSes: ~outer.xSetSystemCall(None, 0)~ delegates to the
+    inner VFS C trampoline which calls ~PyUnicode_FromString(NULL)~ → strlen(NULL)
+    (vfs.c:1492). GDB: ~SIGSEGV at __strlen_evex~.
+- [X] PY026 [HIGH] QueryTokens encoding is not reversible
+  :confirmed: [[file:PY026.patch]]
+  - CONFIRMED — encoding round-trip failure (6 of 8 test cases fail).
+  - Python 3.13.14. Empty lists, leading empties, delimiter-bearing tokens,
+    the literal sentinel, and colocated tokens all fail to round-trip.
+- [X] PY027 [HIGH] Right-nested NOT is serialized with changed semantics
+  :confirmed: [[file:PY027.patch]]
+  - CONFIRMED — serialization changes AST semantics.
+  - ~a NOT (b NOT c)~ serializes as ~a NOT b NOT c~ (no parens). SQLite parses
+    NOT left-associatively, reparsing as ~(a NOT b) NOT c~.
+- [X] PY045 [HIGH] Existing database paths are deleted without explicit consent
+  :confirmed: [[file:PY045.patch]]
+  - CONFIRMED — static analysis (data loss).
+  - ~speedtest.py:437~ calls ~os.remove(options.database)~ before every test
+    run. The ~--database~ help does not disclose destructive replacement.
+- [X] PY046 [HIGH] --data-size makes compared workloads unequal and run-order-dependent
+  :confirmed: [[file:PY046.patch]]
+  - CONFIRMED — static analysis (benchmark correctness).
+  - ~number_name()~ consumes mutable ~random~ state during execution (bindings)
+    vs. generation (no-bindings). Driver order changes which portion of state
+    each driver consumes.
+- [X] PY113 [HIGH] Python 3.10 cannot parse the TaskGroup cancellation example
+  :confirmed: [[file:PY113.patch]]
+  - CONFIRMED — SyntaxError on Python 3.10.
+  - ~examples/async.py:189~ uses ~except*~ (3.11+ syntax). ~python3.10 -m
+    py_compile~ fails. Python 3.10 cannot parse the file at all.
+- [X] PY124 [HIGH] Fixed working-directory database names can alter or delete user data
+  :confirmed: [[file:PY124.patch]]
+  - CONFIRMED — static analysis (example correctness / safety).
+  - ~examples/main.py~ opens ~dbfile~ (line 65), creates/writes/deletes
+    ~myobfudb~ (lines 1218-1242). ~examples/session.py~ uses ~alice.db~,
+    ~bob.db~, ~diff_demo.db~. Direct execution can modify user files.
+- [X] PY133 [HIGH] Archive extraction escapes the extraction root
+  :confirmed: [[file:PY133.patch]]
+  - CONFIRMED — path traversal (file written outside extraction root).
+  - ~setup.py:258-268~ discards the first path component but does not reject
+    surviving ~..~ components. ~top/../../../outside~ writes through
+    ~sqlite3/../outside~.
+- [X] PY184 [HIGH] Python 3.12+ suppresses every named APSW_FAULT injection
+  :confirmed: [[file:PY184.patch]]
+  - CONFIRMED — static analysis (fault-injection coverage).
+  - ~should_fault()~ checks ~pending_exception != (None, None, None)~ but
+    Python 3.12+ sends ~(None,)~. Named faults always return False on 3.12+.
+- [X] PY198 [HIGH] Broad session patterns suppress required mutex wrappers
+  :confirmed: [[file:PY198.patch]]
+  - CONFIRMED — generated debug C lacks all session/changeset wrappers.
+  - Broad pattern ~sqlite3change(group|set)_.*~ suppresses apply wrappers and
+    shadows the specific ~sqlite3changegroup_schema~ rule. v3 apply rule is
+    misspelled. All 5 functions lack mutex enforcement.
+- [X] PY210 [HIGH] Generated JSON is decoded only for a discarded validation result
+  :confirmed: [[file:PY210.patch]]
+  - CONFIRMED — static analysis (benchmark correctness).
+  - ~json_bench.py:51~ parses JSON but discards the result; ~data.extend(items)~
+    uses original JSON strings. ~big_data~ contains strings, not objects.
+- [X] PY211 [HIGH] The row labelled stdlib json.loads measures json.dumps
+  :confirmed: [[file:PY211.patch]]
+  - CONFIRMED — static analysis (benchmark correctness).
+  - ~json_bench.py:90~ calls ~json.dumps(big_data_json)~ but labels it
+    "stdlib json.loads". Serializes an already-serialized string; no decode.
+- [X] PY218 [HIGH] Installed-wheel validation can import the in-tree extension
+  :confirmed: [[file:PY218.patch]]
+  - CONFIRMED — static analysis (test artifact validation).
+  - ~megatest.py:60-73~ runs tests from ~cd {workdir}~ pointing at the source
+    checkout. Python can resolve the in-tree extension before the wheel.
+- [X] PY219 [HIGH] Worker failures are reported but do not fail megatest
+  :confirmed: [[file:PY219.patch]]
+  - CONFIRMED — static analysis (test failure propagation).
+  - ~megatest.py:148-156~ catches exceptions, prints FAIL, but retains no
+    failure state. ~main()~ returns normally; process exits zero despite failures.
+- [X] PY223 [HIGH] Legacy-name test failures do not affect process status
+  :confirmed: [[file:PY223.patch]]
+  - CONFIRMED — static analysis (test failure propagation).
+  - ~tools/names.py:102~ calls ~TextTestRunner().run()~ and discards the
+    result. ~run-tests~ returns successfully even when tests fail.
+- [ ] C001 [MEDIUM] Incorrect ~sqlite3_config~ variadic signatures
+- [ ] C101 [MEDIUM] ~xGetLastError~ truncates every nonempty message by one byte
+- [ ] C102 [MEDIUM] Optional VFS attribute checks suppress real lookup exceptions
+- [ ] C103 [MEDIUM] BestIndex argument indexes overflow or continue with an exception
+- [ ] C104 [MEDIUM] BestIndex leaks ~idxStr~ and an exceptional ~idxnum~
+- [ ] C005 [MEDIUM] Unicode mapper keyword calls leak keyword tuples
+- [ ] C105 [MEDIUM] Optional virtual-table method checks suppress descriptor exceptions
+- [ ] C106 [MEDIUM] Several vtable allocation/argument failures violate exception invariants
+- [ ] C007 [MEDIUM] User-sized VLA is allocated before argument-count validation
+- [ ] C010 [MEDIUM] BoxedCall is not visible to cyclic GC
+- [ ] C016 [MEDIUM] Mutex contention leaks the ~read_into~ buffer export
+- [ ] C017 [MEDIUM] ~Blob.aclose~ on a synchronous connection succeeds without closing
+- [ ] C020 [MEDIUM] Potentially blocking Blob I/O holds the GIL
+- [ ] C025 [MEDIUM] carray allocation failures return without ~MemoryError~
+- [ ] C026 [MEDIUM] CArrayBind owns references but is not GC tracked
+- [ ] C032 [MEDIUM] Dependent registration leaks a Blob weakref or failed Cursor
+- [ ] C033 [MEDIUM] Multiple progress handlers ignore their own ~nsteps~
+- [ ] C034 [MEDIUM] PreUpdate rowids truncate on LLP64
+- [ ] C042 [MEDIUM] Mapping detection loses the tri-state result of ~PyObject_IsInstance~
+- [ ] C043 [MEDIUM] GC-tracked Cursor has no ~tp_clear~
+- [ ] C045 [MEDIUM] Python exception text is omitted when SQLite's errmsg starts NULL
+- [ ] C047 [MEDIUM] Fault-injection hooks use unchecked Python allocations
+- [ ] C048 [MEDIUM] Python 3.12+ hook shape silently disables named APSW faults
+- [ ] C061 [MEDIUM] Numeric subclasses are serialized through overridable ~__str__~
+- [ ] C062 [MEDIUM] libc ~realloc~ failure returns without ~MemoryError~
+- [ ] C067 [MEDIUM] Exception chaining depends on private CPython symbols
+- [ ] C072 [MEDIUM] Session and ChangesetBuilder traversal is disabled by missing GC flags
+- [ ] C074 [MEDIUM] Public ~session_config~ permits SQLite-defined undefined states
+- [ ] C075 [MEDIUM] Oversized builder BLOB path leaks its buffer export
+- [ ] C081 [MEDIUM] ~sqlite3_stmt_explain~ can reprepare while holding the GIL
+- [ ] C085 [MEDIUM] OffsetMapper has reachable signed offset overflow
+- [ ] C092 [MEDIUM] Virtual-table IN conversion discards meaningful SQLite statuses
+- [ ] C093 [MEDIUM] Pending destructor queue has quadratic growth and permanent high-water scans
+- [ ] C096 [MEDIUM] System-call bridge changes valid False/None semantics
+- [ ] C097 [MEDIUM] Inherited short reads discard real trailing NUL bytes
+- [ ] C098 [MEDIUM] User-controlled ~mxPathname~ causes signed overflow and invalid sizes
+- [ ] PY001 [MEDIUM] Prefetched exceptions are reconstructed incorrectly on Python 3.10–3.11
+- [ ] PY002 [MEDIUM] Cancellation can orphan an asyncio task during callback handoff
+- [ ] PY003 [MEDIUM] Auto controller detection rejects valid non-canonical dependency versions
+- [ ] PY005 [MEDIUM] Foreign-key helper can silently leave constraints disabled in a transaction
+- [ ] PY008 [MEDIUM] Default virtual-table rowids are not reliably unique
+- [ ] PY009 [MEDIUM] log_sqlite permanently lowers the configured severity after notices
+- [ ] PY010 [MEDIUM] dbinfo mixes attached-schema bytes with main-schema metadata
+- [ ] PY014 [MEDIUM] query_info actions mode bypasses an existing authorizer
+- [ ] PY016 [MEDIUM] FTS5 option keys are parsed case-sensitively
+- [ ] PY017 [MEDIUM] NGramTokenizer omits the final fallback query n-gram
+- [ ] PY018 [MEDIUM] JSONTokenizer rejects valid escaped slashes
+- [ ] PY020 [MEDIUM] CLI custom tokenizer registration uses a literal name
+- [ ] PY021 [MEDIUM] Tokenizer wrapper factories share mutable callback state
+- [ ] PY024 [MEDIUM] BM25 caches first-invocation weights for an entire MATCH query
+- [ ] PY028 [MEDIUM] Nested column filters serialize to invalid FTS5 syntax
+- [ ] PY029 [MEDIUM] Parser rejects implicit AND after a column-filtered NEAR group
+- [ ] PY030 [MEDIUM] QueryTokens cannot use the advertised JSON dictionary representation
+- [ ] PY031 [MEDIUM] Structured NEAR distances reject zero and accept booleans
+- [ ] PY032 [MEDIUM] Parser accepts caret inside NEAR where FTS5 rejects it
+- [ ] PY034 [MEDIUM] JSON and JSONL emit invalid JSON for blobs over 57 bytes
+- [ ] PY035 [MEDIUM] Valid quoted identifiers are rendered as malformed SQL
+- [ ] PY036 [MEDIUM] NO_COLOR consumes unrelated command-line options
+- [ ] PY037 [MEDIUM] Input decoding ignores the configured error handler
+- [ ] PY038 [MEDIUM] Echo mode replaces binding diagnostics with AttributeError
+- [ ] PY047 [MEDIUM] Indexed lookup workloads frequently target absent or biased keys
+- [ ] PY048 [MEDIUM] Correctness mismatches do not fail the process
+- [ ] PY049 [MEDIUM] A single iteration crashes summary generation
+- [ ] PY050 [MEDIUM] --vfs is silently ignored by sqlite3 runs
+- [ ] PY053 [MEDIUM] load unnecessarily enables SQL load_extension and changes state before validation
+- [ ] PY055 [MEDIUM] `assertRaisesRoot` callable mode succeeds when no exception is raised
+- [ ] PY056 [MEDIUM] Source-order checks omit required adjacent comparisons
+- [ ] PY057 [MEDIUM] Repeated test runs overwrite an earlier failing exit status
+- [ ] PY059 [MEDIUM] `assertTablesEqual` compares the left schema with itself
+- [ ] PY061 [MEDIUM] `.load` coverage is disabled by a misspelled capability check
+- [ ] PY062 [MEDIUM] Expected-error paths pass when `shellclass.Error` is not raised
+- [ ] PY065 [MEDIUM] `testOverwrite` leaves `apsw.async_run_coro` modified on the runner thread
+- [ ] PY068 [MEDIUM] Optional dependency version parsing rejects valid PEP 440 release spellings
+- [ ] PY069 [MEDIUM] Effective-deadline assertions accept incorrect deadline propagation
+- [ ] PY072 [MEDIUM] Worker-side attribute classification does not await queued requests
+- [ ] PY077 [MEDIUM] FileIO capability guard always bypasses the behavioral test
+- [ ] PY079 [MEDIUM] sqlite_stmt is excluded only from the pre-load module snapshot
+- [ ] PY080 [MEDIUM] SQLAR command failures and crashes are accepted
+- [ ] PY081 [MEDIUM] sqlite3_getlock output and stderr assertion failures are swallowed
+- [ ] PY083 [MEDIUM] Fork-violation checks succeed even when no violation is observed
+- [ ] PY084 [MEDIUM] testManyConnections runs after the checker has been disabled
+- [ ] PY087 [MEDIUM] FTS5 auxiliary test class is omitted from normal-suite discovery
+- [ ] PY088 [MEDIUM] UnicodeData validation processes only the final record
+- [ ] PY096 [MEDIUM] Unbounded retention and duplication of statement timings
+- [ ] PY097 [MEDIUM] Tracer callback slots silently collide with application callbacks
+- [ ] PY098 [MEDIUM] Target executes in the tracer's existing =__main__= namespace
+- [ ] PY099 [MEDIUM] Options intended for the target are rejected
+- [ ] PY100 [MEDIUM] Blob logging changes byte values and marks exact-limit values as truncated
+- [ ] PY101 [MEDIUM] Individual timing output can discard significant leading digits
+- [ ] PY104 [MEDIUM] =text_wrap= disables hyphenation for multiline input
+- [ ] PY105 [MEDIUM] =expand_tabs= does not preserve line-break count or terminal-break state
+- [ ] PY107 [MEDIUM] =guess_paragraphs= destroys CRLF before normalizing it
+- [ ] PY121 [MEDIUM] `ContextVar.set()` is used as a context manager on unsupported Python versions
+- [ ] PY125 [MEDIUM] Complex-number conversion fails for valid values
+- [ ] PY126 [MEDIUM] Symlink-following filesystem traversal can recurse through cycles
+- [ ] PY130 [MEDIUM] Bundled SQL is resolved from the process working directory
+- [ ] PY134 [MEDIUM] Download timeout absence and unpinned HTTP downgrade
+- [ ] PY136 [MEDIUM] Extension-test markers are invisible to in-process tests
+- [ ] PY137 [MEDIUM] Source-distribution generation overwrites and leaves =setup.apsw=
+- [ ] PY139 [MEDIUM] No-old-names stub customization mutates the source tree
+- [ ] PY140 [MEDIUM] ICU helper failures and quoted flags are mishandled
+- [ ] PY141 [MEDIUM] =Self= and =Buffer= imports exceed supported typing targets
+- [ ] PY142 [MEDIUM] Window =step= and =inverse= protocols require exactly one value
+- [ ] PY143 [MEDIUM] =WindowFinal= incorrectly permits SQL arguments
+- [ ] PY144 [MEDIUM] SQL callback result aliases omit supported result values
+- [ ] PY145 [MEDIUM] =AsyncConnectionController.send= excludes regular methods returning awaitables
+- [ ] PY149 [MEDIUM] APSW and aiosqlite use different transaction regimes
+- [ ] PY150 [MEDIUM] CPU component columns combine incompatible clocks
+- [ ] PY151 [MEDIUM] Direct uvloop modes fail on Python 3.10 and 3.11
+- [ ] PY161 [MEDIUM] Shared docdb updates race and broad exception silently resets data
+- [ ] PY167 [MEDIUM] Live TOC metadata is not tied to the pinned SQLite version
+- [ ] PY168 [MEDIUM] Multi-call expansion deletes following documentation
+- [ ] PY170 [MEDIUM] Validation failures can leave source and artifacts partly updated
+- [ ] PY172 [MEDIUM] C block replacement uses ambiguous substring and brace heuristics
+- [ ] PY173 [MEDIUM] Public APSW types are excluded without member audit
+- [ ] PY180 [MEDIUM] Final example-section output is never emitted
+- [ ] PY181 [MEDIUM] Temporary publication is non-atomic, mode-changing, and Windows-sensitive
+- [ ] PY182 [MEDIUM] Locale-dependent encoding breaks current example generation
+- [ ] PY185 [MEDIUM] Multi-fault exception verification is under-constrained
+- [ ] PY186 [MEDIUM] Fixed /tmp/fitesting database escapes managed run isolation
+- [ ] PY188 [MEDIUM] Leak detection can block or continue instead of failing
+- [ ] PY191 [MEDIUM] Compilation entries pair file values with another translation unit
+- [ ] PY192 [MEDIUM] Compound compiler commands are emitted as one executable argument
+- [ ] PY193 [MEDIUM] Standard Windows Python configurations are unsupported
+- [ ] PY194 [MEDIUM] Fault inventory omits actively used faultable Python APIs
+- [ ] PY202 [MEDIUM] Multipart message headers are taken from the selected MIME leaf
+- [ ] PY203 [MEDIUM] MIME bodies are not transfer-decoded and body selection can choose an attachment
+- [ ] PY204 [MEDIUM] Base64 cleanup regex deletes legitimate text and leaves quoted blocks incomplete
+- [ ] PY205 [MEDIUM] Raw SQL table-name interpolation affects both importers
+- [ ] PY208 [MEDIUM] Strict UTF-8 decoding rejects valid HTML in other encodings
+- [ ] PY217 [MEDIUM] System-Python jobs misrepresent configuration and GIL coverage
+- [ ] PY220 [MEDIUM] Startup cleanup can delete host user-site packages and sibling-tree data
+- [ ] PY221 [MEDIUM] Shell interpolation permits command injection and unsafe path handling
+- [ ] PY222 [MEDIUM] Free-threaded jobs suppress broad warning and bytes strictness
+- [ ] PY226 [MEDIUM] Recipe archive decoding depends on the process locale
+- [ ] PY227 [MEDIUM] Compile-option values containing = are parsed incorrectly
+- [ ] PY228 [MEDIUM] Decimal coercion hides distinct C compile-time values
+- [ ] PY231 [MEDIUM] Valueless SQLite options become empty macro definitions
+- [ ] PY239 [MEDIUM] Numbered Unicode-name suffixes are not validated
+- [ ] PY240 [MEDIUM] A Unicode-17 Tangut range is emitted for older source data
+- [ ] PY242 [MEDIUM] Strip mappings retain decomposable intermediates
+- [ ] PY244 [MEDIUM] Unicode inputs are not bound to one immutable release
+- [ ] PY245 [MEDIUM] Optimized Python disables external-UCD integrity checks
+- [ ] PY246 [MEDIUM] Marker-based update can target or truncate the wrong Python source
+- [ ] PY249 [MEDIUM] Bootstrap and prerequisite failures can report successful builds
+- [ ] PY250 [MEDIUM] Extension-only builds compile and publish executable-only prerequisites
+- [ ] PY251 [MEDIUM] RST generation can leave a partial target that Make treats as current
+- [ ] PY252 [MEDIUM] Repr variants use independently generated data and confound comparisons
+- [ ] PY253 [MEDIUM] Fixed ordering and absent warm-up may bias benchmark variants
+- [ ] C100 [LOW] Every ~xSync~ callback drops an owned flags-integer reference
+- [ ] C002 [LOW] Legacy global module state is not subinterpreter-safe
+- [ ] C003 [LOW] Large ~randomness~ and ~complete~ operations retain the GIL
+- [ ] C006 [LOW] Embedded-NUL keyword names alias valid keywords
+- [ ] C107 [LOW] Embedded NUL in BestIndex ~idxStr~ is silently truncated
+- [ ] C008 [LOW] List-item error reports the list type, not the bad item type
+- [ ] C011 [LOW] Zero-argument async dispatch can call ~memcpy(NULL, ..., 0)~
+- [ ] C012 [LOW] ~PyContext_Exit~ failure is ignored
+- [ ] C015 [LOW] Blob offset arithmetic has reachable signed overflow
+- [ ] C018 [LOW] Context exit masks a block exception after manual close
+- [ ] C019 [LOW] ~zeroblob.length~ truncates on Windows LLP64
+- [ ] C021 [LOW] An aborted Blob handle can be misreported as EOF or ValueError
+- [ ] C027 [LOW] carray error formatting has variadic type mismatches
+- [ ] C028 [LOW] carray bind destructor assumes an attached Python thread state
+- [ ] C029 [LOW] Narrow carray slices retain the whole source tuple
+- [ ] C035 [LOW] Empty BLOB comparison can call ~memcmp(NULL, NULL, 0)~
+- [ ] C036 [LOW] Large database serialization retains the GIL
+- [ ] C037 [LOW] Generated reverse mapping hides ~SQLITE_DBCONFIG_FP_DIGITS~
+- [ ] C046 [LOW] ~extendedresult~ can contradict the exception's primary SQLite class
+- [ ] C049 [LOW] Fault hook recursion-limit arithmetic can overflow
+- [ ] C050 [LOW] Temporary recursion-limit changes overwrite user/concurrent changes
+- [ ] C051 [LOW] ~sys.apsw_should_fault = None~ aborts the process
+- [ ] C052 [LOW] Fault-control result does not validate its exception class
+- [ ] C053 [LOW] Loadable-extension SQLite API thunk can be rewritten concurrently
+- [ ] C057 [LOW] Several FTS tuple builders grow quadratically
+- [ ] C058 [LOW] Tokenizer locale length narrows to ~int~ without a bound
+- [ ] C059 [LOW] FTS5 v4 callback fields are used without checking ~iVersion~
+- [ ] C063 [LOW] Object decoder leaks its partial builder on insertion failure
+- [ ] C064 [LOW] Hexadecimal ~parse_int~ callback receives base 0, not documented 16
+- [ ] C065 [LOW] Raw JSONB text is validated and UTF-8 decoded in two full passes
+- [ ] C066 [LOW] Note-formatting failure loses the pending exception
+- [ ] C068 [LOW] ~PyThreadState_GetDict~ NULL result is passed to a dict API
+- [ ] C076 [LOW] Large callback-free changeset operations retain the GIL
+- [ ] C078 [LOW] Recycle bin uses only three of four slots
+- [ ] C079 [LOW] Cache statistics wrap after ~UINT_MAX~
+- [ ] C082 [LOW] Test extension reports successful loading when function registration fails
+- [ ] C083 [LOW] Test extension's standard SQLite API thunk has the same qualified race
+- [ ] C086 [LOW] Mutable UTF-8 buffers invalidate mapper validation
+- [ ] C087 [LOW] Two mapper types can form cycles invisible to GC
+- [ ] C088 [LOW] Extreme ~grapheme_find~ bounds underflow signed arithmetic
+- [ ] C089 [LOW] Unicode mapper allocation failures omit ~MemoryError~
+- [ ] C090 [LOW] Negative grapheme slicing boxes every boundary
+- [ ] C099 [LOW] Failed VFS ~xOpen~ does not explicitly clear ~pMethods~
+- [ ] PY004 [LOW] contextvar_set has an incorrect pre-Python-3.14 return annotation
+- [ ] PY006 [LOW] WAL helper discards the effective journal mode
+- [ ] PY007 [LOW] connection_optimize understates immediate ANALYZE and write behavior
+- [ ] PY011 [LOW] DataClassRowFactory rename mode can still generate duplicate field names
+- [ ] PY012 [LOW] Virtual-table declaration identifiers are not safely escaped
+- [ ] PY013 [LOW] Nested virtual-table prefixes assign shadow tables to the wrong group
+- [ ] PY015 [LOW] DataClassRowFactory mutates caller-owned namespace mappings
+- [ ] PY019 [LOW] text_for_token limits occurrences rather than documents
+- [ ] PY022 [LOW] more_like constructs an invalid empty OR query
+- [ ] PY023 [LOW] Cache refresh uses a new lock for every attempt
+- [ ] PY025 [LOW] BM25 does not match SQLite conversion of SQL weight values
+- [ ] PY033 [LOW] Structured collection fields treat strings as character sequences
+- [ ] PY039 [LOW] Empty JSON result sets produce no JSON document
+- [ ] PY040 [LOW] Auto-import classifies impossible calendar dates as dates
+- [ ] PY041 [LOW] --no-unicode enables Unicode line drawing
+- [ ] PY042 [LOW] Completion termination indexes past the completion list
+- [ ] PY043 [LOW] Unicode SQL error rendering can replace the original exception
+- [ ] PY044 [LOW] .shell reports encoded POSIX wait status rather than exit code
+- [ ] PY051 [LOW] Numeric options accept invalid or meaningless configurations
+- [ ] PY052 [LOW] Elapsed benchmark timing uses an adjustable wall clock
+- [ ] PY054 [LOW] Explicit --help exits unsuccessfully and writes help to stderr
+- [ ] PY058 [LOW] Nonpositive repeated-run counts leave the exit status uninitialized
+- [ ] PY060 [LOW] `testSanity` discards a mapping consistency comparison
+- [ ] PY063 [LOW] Invalid-encoding `.autoimport` diagnostic fixture is skipped
+- [ ] PY064 [LOW] `ResourceWarning` suppression has execution-context-dependent global scope
+- [ ] PY066 [LOW] `allow_missing_dict_bindings` is restored to a hard-coded value
+- [ ] PY067 [LOW] Best-practice test cleanup replaces all pre-existing connection hooks
+- [ ] PY070 [LOW] Async tests rely on private unittest result internals
+- [ ] PY071 [LOW] Async metadata verification is absent from ordinary suite entry points
+- [ ] PY073 [LOW] Runtime metadata verification unconditionally requires Session support
+- [ ] PY074 [LOW] `apsw.async_controller` is not restored after metadata testing
+- [ ] PY075 [LOW] Explicit INT32 reinterpretation has an inadequate oracle
+- [ ] PY076 [LOW] Missing or broken NumPy is reported as a passing test
+- [ ] PY078 [LOW] fsdir validation treats the root directory row as a file
+- [ ] PY082 [LOW] OpenBSD bypasses subprocess return-code validation
+- [ ] PY085 [LOW] Unexpected child exceptions lose their traceback diagnostic
+- [ ] PY086 [LOW] Imported-module warning suppression is ineffective
+- [ ] PY089 [LOW] Unicode break subprocess reopens an open NamedTemporaryFile
+- [ ] PY090 [LOW] FTS5 auxiliary comparisons allow truncated actual results
+- [ ] PY091 [LOW] Tab-to-vertical-tab normalization hides decoding errors
+- [ ] PY092 [LOW] Core JSONB checks disappear under optimized Python
+- [ ] PY093 [LOW] Decimal context precision leaks across tests
+- [ ] PY094 [LOW] Global session stream-size configuration leaks process state
+- [ ] PY095 [LOW] table_filter relies on an assertion with required side effects
+- [ ] PY102 [LOW] String and SQL logging permits ambiguous delimiters and raw terminal controls
+- [ ] PY103 [LOW] Negative numeric limits receive accidental slicing semantics
+- [ ] PY106 [LOW] =text_wrap= accepts invalid arguments and can yield invalid results
+- [ ] PY108 [LOW] =word_iter_with_offsets= has an incorrect public return annotation
+- [ ] PY109 [LOW] =grapheme_find= documentation contradicts empty-needle behavior
+- [ ] PY110 [LOW] CLI =casefold= and =strip= stdin/stdout defaults are ineffective
+- [ ] PY111 [LOW] Benchmark mode divides by zero for an empty source file
+- [ ] PY112 [LOW] Missing documentation metadata is checked with =assert=
+- [ ] PY114 [LOW] Backup connections lack deterministic exception-safe cleanup
+- [ ] PY115 [LOW] The second timeout reports cumulative rather than local elapsed time
+- [ ] PY116 [LOW] Changeset-size estimate is printed as a literal placeholder
+- [ ] PY117 [LOW] Standalone execution depends on a non-shipped fixture and can create an empty database
+- [ ] PY118 [LOW] Empty FTS results leave the first result variable undefined
+- [ ] PY119 [LOW] The custom tokenizer accepts zero and negative block sizes
+- [ ] PY120 [LOW] The custom tokenizer factory has an incorrect return annotation
+- [ ] PY122 [LOW] Tagged-object decoding is overbroad
+- [ ] PY123 [LOW] The introductory typing comment falsely says postponed annotations are mandatory
+- [ ] PY127 [LOW] The “oldest Python files” query orders by file size
+- [ ] PY128 [LOW] Incremental blob cleanup is not exception-safe
+- [ ] PY129 [LOW] Trace callback puts required mutations inside an assertion
+- [ ] PY131 [LOW] Session availability is reported but Session APIs are still used unconditionally
+- [ ] PY132 [LOW] The rebased changeset is computed but never demonstrated or applied
+- [ ] PY135 [LOW] Fetch removes the existing SQLite tree before successful replacement
+- [ ] PY138 [LOW] =--missing-checksum-ok= does not apply to the amalgamation
+- [ ] PY146 [LOW] =JSONBTypes= models tuples as exactly one element
+- [ ] PY147 [LOW] =TokenizerResult= includes malformed empty tuple forms
+- [ ] PY148 [LOW] =WindowFactory= excludes runtime-supported list results
+- [ ] PY152 [LOW] Reported checksum mismatches exit successfully
+- [ ] PY153 [LOW] Downloads have no tool-controlled time or resource bounds
+- [ ] PY154 [LOW] Minimum SQLite version is selected lexicographically
+- [ ] PY155 [LOW] Version normalization permits collisions and relies on removable assertions
+- [ ] PY156 [LOW] Fault-injection exclusion misses current conditional form
+- [ ] PY157 [LOW] Gcov files are decoded using the ambient locale
+- [ ] PY158 [LOW] Gcov exceptional zero-count marker is counted as executed
+- [ ] PY159 [LOW] Shared TOC URL handling requires a trailing slash and lacks a finite timeout
+- [ ] PY160 [LOW] Open temporary TOC databases may not reopen on native Windows
+- [ ] PY162 [LOW] Output publication is non-atomic and path-collision unsafe
+- [ ] PY163 [LOW] Consecutive SQLite-call markers retain only the final RST marker
+- [ ] PY164 [LOW] Bad CLI arity handling continues and the SQLite-version argument is dead
+- [ ] PY165 [LOW] Malformed parser state enters interactive pdb
+- [ ] PY166 [LOW] Reverse mappings select incidental sentinel aliases
+- [ ] PY169 [LOW] Generated constant docstrings contain malformed RST links
+- [ ] PY171 [LOW] Unsupported signatures can invoke an interactive debugger
+- [ ] PY174 [LOW] Missing documented members abort before the intended diagnostic
+- [ ] PY175 [LOW] Virtual-table protocols are validated only by member count
+- [ ] PY176 [LOW] Pragma consistency checks disappear under optimized Python
+- [ ] PY177 [LOW] Marker replacement can truncate documents
+- [ ] PY178 [LOW] Existing literal-block markers become triple-colon output
+- [ ] PY179 [LOW] Colon lookahead can raise IndexError
+- [ ] PY183 [LOW] gen_rst flushes an accidental global instead of its output stream
+- [ ] PY187 [LOW] Emergency traceback printing raises a secondary TypeError
+- [ ] PY189 [LOW] Unknown faults enter an interactive debugger
+- [ ] PY190 [LOW] Missing example name raises NameError while building its diagnostic
+- [ ] PY195 [LOW] Regeneration bypasses the configured Python
+- [ ] PY196 [LOW] nm can interpret the inspected filename as an option
+- [ ] PY197 [LOW] Generated-header publication is non-atomic
+- [ ] PY199 [LOW] Generated macros evaluate the checked argument twice
+- [ ] PY200 [LOW] git grep errors are treated as ordinary absence
+- [ ] PY201 [LOW] Failed generation can leave a partial target considered current
+- [ ] PY206 [LOW] Progress output has a duplicate terminal percentage and unsupported fixed denominator
+- [ ] PY207 [LOW] Automatic VACUUM can obscure completed import work
+- [ ] PY209 [LOW] HTML-suffixed ZIP directory entries are imported as documents
+- [ ] PY212 [LOW] Claimed JSONB warm-up does not call either function
+- [ ] PY213 [LOW] Help and argparse diagnostics require benchmark dependencies first
+- [ ] PY214 [LOW] Source vocabulary is read using the locale default encoding
+- [ ] PY215 [LOW] Monte Carlo estimates omit uncertainty information
+- [ ] PY216 [LOW] Configuring a lower bound above one raises KeyError
+- [ ] PY224 [LOW] Subcommands depend inconsistently on the caller's working directory
+- [ ] PY225 [LOW] Locale-dependent decoding can prevent legacy-name test execution
+- [ ] PY229 [LOW] Dynamically loaded SQLite reporting is Linux-specific and can be misleading
+- [ ] PY230 [LOW] Standard-library sqlite3 is labeled pysqlite3
+- [ ] PY232 [LOW] Diagnostic options are serialized as source definitions
+- [ ] PY233 [LOW] The checked path can differ from the library loaded
+- [ ] PY234 [LOW] Blind identifier substitution can corrupt existing RST markup
+- [ ] PY235 [LOW] Global asterisk replacement can change literal values
+- [ ] PY236 [LOW] Output encoding depends on the process locale
+- [ ] PY237 [LOW] Destination is truncated before generation succeeds
+- [ ] PY238 [LOW] Python data objects use class roles
+- [ ] PY241 [LOW] Standalone generation decodes official UCD input using the process locale
+- [ ] PY243 [LOW] Output publication can truncate generated C before generation succeeds
+- [ ] PY247 [LOW] Invalid ~--table-limit~ values are accepted until late generation
+- [ ] PY248 [LOW] Repository Python-source I/O depends on the locale encoding

@@ -1,0 +1,10 @@
+# C039: Cursor user callbacks run before the reentrancy guard
+#
+# CONFIRMED — static analysis (reentrancy / state corruption)
+#
+# Recursive use of the same cursor can pass the recursive SQLite mutex and
+# reset/replace the outer operation's statement, iterator, and bindings.
+# In executemany, the binding converter and execution tracer are guarded,
+# but binding normalization and statement preparation still precede the
+# in_query check (cursor_mutex_get).  A tracer callback that re-enters
+# execute() on the same cursor can corrupt the outer statement state.

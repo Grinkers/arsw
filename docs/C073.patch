@@ -1,0 +1,9 @@
+# C073: Builder bookkeeping failure leaves SQLite holding an untracked database pointer
+#
+# CONFIRMED — static analysis (use-after-close / ownership)
+#
+# After sqlite3changegroup_schema successfully stores the raw database
+# (session.c:2577-2597), weakref creation or dependent-list append can fail.
+# The builder remains usable but is not registered for closure before the
+# Connection, allowing later use of a closed database.  Requires fault
+# injection to trigger weakref/list append failure.

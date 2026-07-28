@@ -1,0 +1,8 @@
+# C070: Several Session operations bypass the connection mutex and async affinity
+#
+# CONFIRMED — static analysis (data race / callback lifetime)
+#
+# table_filter, config, memory_used, and changeset_size (session.c:758-845,
+# 970-997) access/mutate SQLite Session state without dbmutex or async worker
+# routing.  Replacing the filter can decref a callback while SQLite still holds
+# its raw context; 64-bit state reads can race native updates.

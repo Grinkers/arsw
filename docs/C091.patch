@@ -1,0 +1,8 @@
+# C091: Failed PyMem_Resize destroys the pending-call queue pointer
+#
+# CONFIRMED — static analysis (NULL dereference / resource leak)
+#
+# PyMem_Resize is an assigning macro (util.c:154-176).  On failure it overwrites
+# the global pending_call_slots with NULL while count remains nonzero, leaks the
+# old allocation, and leaves the already-registered dispatcher to index NULL.
+# It also fails to establish MemoryError.  Requires memory exhaustion to trigger.

@@ -1,0 +1,20 @@
+# PY027: Right-nested NOT is serialized with changed semantics
+#
+# CONFIRMED — serialization changes AST semantics
+#
+# Serialization parenthesizes solely by precedence and treats both children of
+# NOT identically. A right-nested NOT is emitted without parentheses:
+# "a NOT b NOT c". SQLite parses NOT left-associatively, so this reparses as
+# (a NOT b) NOT c rather than a NOT (b NOT c).
+#
+# Run:
+#   PYTHONPATH=. python docs/PY027.patch
+#
+from apsw.fts5query import parse_query_string, to_query_string, NOT, PHRASE
+
+ast = NOT(PHRASE("a"), NOT(PHRASE("b"), PHRASE("c")))
+serialized = to_query_string(ast)
+assert serialized == "a NOT b NOT c", f"unexpected: {serialized!r}"
+print(f"Original:  a NOT (b NOT c)")
+print(f"Serialized: {serialized!r}")
+print("BUG: right-nested NOT has no parens → reparses as (a NOT b) NOT c")

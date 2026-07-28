@@ -1,0 +1,8 @@
+# PY211: The row labelled stdlib json.loads measures json.dumps
+#
+# CONFIRMED — static analysis (benchmark correctness)
+#
+# tools/json_bench.py:90 calls json.dumps(big_data_json) but labels the result
+# "stdlib json.loads" (line 91). This serializes an already-serialized JSON
+# string, adding escaping and outer quotes; it does not decode JSON. The
+# reported stdlib decode timing is invalid.

@@ -1,0 +1,9 @@
+# C071: Schema-backed ChangesetBuilder uses a raw database without its mutex
+#
+# CONFIRMED — static analysis (data race / async affinity)
+#
+# sqlite3changegroup_schema retains the raw database (session.c:2167-2231).
+# Subsequent additions that encounter a new table consult its schema/defaults
+# (session.c:2273-2601).  Neither schema-setup nor the add paths hold the
+# connection mutex or route to the AsyncConnection worker, so they race
+# connection execution, schema changes, or close.

@@ -1,0 +1,8 @@
+# PY045: Existing database paths are deleted without explicit consent
+#
+# CONFIRMED — static analysis (data loss)
+#
+# speedtest.py:437 calls os.remove(options.database) before every test run if
+# the file exists. The --database help says only "The database file to use"
+# and does not disclose destructive replacement. Supplying an existing database
+# path silently and irreversibly destroys user data.

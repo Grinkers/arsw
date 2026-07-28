@@ -1,0 +1,14 @@
+# C055: Ignored colocated tokens leak a PyGILState_Ensure level
+#
+# CONFIRMED — static analysis (GIL / thread state)
+#
+# xTokenizer_Callback (fts.c:97-104):
+#   PyGILState_STATE gilstate = PyGILState_Ensure();
+#   ...
+#   if (iflags == FTS5_TOKEN_COLOCATED && !our_context->include_colocated)
+#       return SQLITE_OK;   // returns without PyGILState_Release!
+#
+# The fast return for an ignored FTS5_TOKEN_COLOCATED token bypasses
+# PyGILState_Release, leaking a GIL state level.  A third-party C tokenizer
+# invoking without the GIL can trigger this path, causing deadlock or fatal
+# thread-state behavior.  Requires a C tokenizer that releases the GIL.

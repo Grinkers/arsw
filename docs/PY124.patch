@@ -1,0 +1,9 @@
+# PY124: Fixed working-directory database names can alter or delete user data
+#
+# CONFIRMED — static analysis (example correctness / safety)
+#
+# examples/main.py opens "dbfile" (line 65), modifies it, later opens "myobfudb"
+# (line 1218), writes, and unconditionally deletes it (line 1242).
+# examples/session.py backs up into "alice.db"/"bob.db" (lines 248-254) and
+# creates "diff_demo.db"/"other.db" (lines 489-502). Direct execution can
+# modify or delete unrelated files in the working directory.

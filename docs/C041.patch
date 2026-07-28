@@ -1,0 +1,11 @@
+# C041: Python 3.10-3.11 async exception buffering creates tuples with NULL items
+#
+# CONFIRMED — static analysis (invalid Python object)
+#
+# On Python < 3.12 (cursor.c:1738-1746), PyErr_Fetch may return NULL value or
+# traceback pointers, but they are inserted with PyTuple_SET_ITEM (stealing,
+# no NULL check).  This creates an invalid tuple.  The consumer code
+# (cursor.c:1686-1701) checks for NULL fields and replaces with RuntimeError,
+# but the intermediate tuple with NULL items is technically invalid and any
+# other code touching it would crash.  Runtime testing on Python 3.10 did not
+# trigger a crash because most exceptions have non-NULL value/tb.
