@@ -1989,6 +1989,29 @@ class Unicode(unittest.TestCase):
                 self.assertEqual(list(meth_iter(test)), list(s[2] for s in seen))
                 self.assertEqual(list(meth_iter_with_offsets(test)), seen)
 
+    def testC004UnicodeOffsetBounds(self):
+        """C004: Unicode offsets stop at len(text), not len(text) + 1."""
+        text = "A"
+        unicode_c = apsw.unicode._unicode
+        offset_apis = (
+            ("grapheme_next_break", lambda offset: unicode_c.grapheme_next_break(text, offset)),
+            ("word_next_break", lambda offset: unicode_c.word_next_break(text, offset)),
+            ("sentence_next_break", lambda offset: unicode_c.sentence_next_break(text, offset)),
+            ("line_next_hard_break", lambda offset: unicode_c.line_next_hard_break(text, offset)),
+            ("line_next_break", lambda offset: unicode_c.line_next_break(text, offset)),
+            ("text_width", lambda offset: unicode_c.text_width(text, offset)),
+            ("grapheme_length", lambda offset: unicode_c.grapheme_length(text, offset)),
+            ("has_category start", lambda offset: unicode_c.has_category(text, offset, len(text), 0)),
+            ("has_category end", lambda offset: unicode_c.has_category(text, len(text), offset, 0)),
+        )
+
+        for name, call in offset_apis:
+            with self.subTest(api=name, offset="len"):
+                call(len(text))
+            with self.subTest(api=name, offset="len + 1"):
+                with self.assertRaises(ValueError):
+                    call(len(text) + 1)
+
     def testBreaksFull(self):
         "Tests full official break tests (if available)"
 
