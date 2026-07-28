@@ -1,17 +1,19 @@
 #+title: APSW Python source audit
 #+date: 2026-07-28
-#+property: commit f08ced5e5b264955ea4c48182da4be2e13072113
+#+property: commit 69e0f6be7980c1f641f402312a056b9de4d06ba5
 #+property: python-floor 3.10
 #+property: scope 59 tracked Python files
 
 * Scope and method
 
 This is a read-only source audit of every Python file tracked at commit
-=f08ced5e5b264955ea4c48182da4be2e13072113=.  One primary audit and one
-independent validation pass were performed for each of the 59 files.  Related
-C implementations, generated artifacts, tests, documentation, build recipes,
-and call sites were inspected only to validate Python findings and identify
-canonical fix locations.  No C or Python source remediation was performed.
+=69e0f6be7980c1f641f402312a056b9de4d06ba5=.  One primary audit and one
+independent validation pass were performed for each of the 59 files.  After
+rebasing, every finding was rechecked and all file/line references were
+remapped to that tree.  Related C implementations, generated artifacts, tests,
+documentation, build recipes, and call sites were inspected only to validate
+Python findings and identify canonical fix locations.  No C or Python source
+remediation was performed.
 
 The checkout did not contain a built APSW extension.  Pure-Python behavior was
 reproduced where practical; APSW-, platform-, schedule-, benchmark-, and
@@ -81,18 +83,18 @@ No actionable findings. The module is a correct minimal adapter to
 *** PY001 [MEDIUM] Prefetched exceptions are reconstructed incorrectly on Python 3.10–3.11
 :PROPERTIES:
 :FILE: apsw/aio.py
-:LINES: 226-231
+:LINES: apsw/aio.py:226-236; src/cursor.c:1738-1749; apsw/tests/aiotest.py:484-517
 :CATEGORY: Exception handling
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-Evidence: The pre-3.12 path reconstructs a captured exception with `exc[0](exc[1]).with_traceback(exc[2])`. For normalized exception tuples, `exc[1]` is already the exception instance; constructing a new instance changes its arguments, loses instance state and notes, and can invoke a constructor that raises a different exception. The C prefetch path captures a legacy `(type, value, traceback)` tuple, but does not explicitly normalize it before dispatch, so the Python helper must not assume a normalized instance without ensuring it.
+Evidence: The pre-3.12 path reconstructs a captured exception with `exc[0](exc[1]).with_traceback(exc[2])`. For tuples whose value is already a normalized exception instance, `exc[1]` is that instance; constructing a new instance changes its arguments, loses instance state and, on Python 3.11, notes, and can invoke a constructor that raises a different exception. The C prefetch path captures a legacy `(type, value, traceback)` tuple, but does not explicitly normalize it before dispatch, so the Python helper must not assume a normalized instance without ensuring it.
 
 Impact: A callback exception raised after prefetched rows may be replaced, corrupted, or turned into `TypeError` on Python 3.10–3.11. Existing coverage only verifies that a simple `ZeroDivisionError` is catchable, not preservation of exception identity or state.
 
 - Direction: Normalize exceptions at the capture boundary and re-raise the normalized exception value with its traceback; otherwise handle the full legacy tuple semantics rather than reconstructing blindly.
-- Test: On Python 3.10 and 3.11, prefetch rows before a UDF or row trace raises a custom exception with restrictive constructor arguments, custom attributes, and notes. Assert the eventual exception retains its class, arguments, state, notes, and traceback.
+- Test: On Python 3.10 and 3.11, prefetch rows before a UDF or row trace raises a custom exception with restrictive constructor arguments and custom attributes. Assert the eventual exception retains its class, arguments, state, and traceback; on Python 3.11 also assert that notes are preserved.
 
 
 *** PY002 [MEDIUM] Cancellation can orphan an asyncio task during callback handoff
@@ -429,7 +431,7 @@ The CLI parses =--register name=module.callable= into =name= and a factory, but 
 
 - Direction: Keep the factory callback immutable and derive an invocation-local callback, such as =instance_get = options.get("get", get)=; close each tokenizer over its instance-local callback. Apply the same pattern to =test= and =transform=.
 
-- Test: For each wrapper, instantiate one factory with callback A and then callback B; verify both returned tokenizers retain their independent behavior. Repeat in reverse order and add coordinated concurrent initialization coverage where supported.
+- Test: For each wrapper, instantiate a callback-configurable factory twice, first with callback A and then callback B; verify both returned tokenizers retain their independent behavior. Repeat in reverse order and add coordinated concurrent initialization coverage where supported.
 
 
 *** PY022 [LOW] more_like constructs an invalid empty OR query
@@ -662,13 +664,13 @@ Blob values are encoded with =base64.encodebytes()=, which inserts line breaks. 
 *** PY036 [MEDIUM] NO_COLOR consumes unrelated command-line options
 :PROPERTIES:
 :FILE: apsw/shell.py
-:LINES: 296-300, 350-368
+:LINES: 80-162,229-230,241-300,347-368
 :CATEGORY: Command-line parsing
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-The no-colour parser branch matches either an explicit no-colour option *or* the presence of =NO_COLOR=. When the environment variable is set, whichever argument is currently being processed is removed without its own action being performed. For example, =-csv= can be consumed without selecting CSV mode; filename-only and empty invocations also do not consistently apply the environment policy.
+The no-colour parser branch matches either an explicit no-colour option *or* the presence of =NO_COLOR=. When the environment variable is set, the first argument reaching this late branch is removed without its own action being performed; earlier parser branches such as `-header` still run normally. For example, =-csv= can be consumed without selecting CSV mode; filename-only and empty invocations also do not consistently apply the environment policy.
 
 - Direction: Apply =NO_COLOR= once during initialization or before option parsing. Limit the parser branch to explicit no-colour option spellings.
 
@@ -771,20 +773,20 @@ Both =--unicode= and =--no-unicode= use =action="store_true"= for =use_unicode=.
 - Test: Mock completion generation and cover empty, one-entry, and multi-entry lists through the first out-of-range state.
 
 
-*** PY043 [LOW] Unicode SQL error rendering can mask the original SQL error
+*** PY043 [LOW] Unicode SQL error rendering can replace the original exception
 :PROPERTIES:
 :FILE: apsw/shell.py
-:LINES: 949-959
+:LINES: 949-961
 :CATEGORY: Error reporting
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-SQLite error offsets are UTF-8 byte offsets. The shell takes arbitrary 35-byte context slices around the offset and strictly decodes each slice. Either slice boundary can split a multibyte character, causing =UnicodeDecodeError= while formatting the original SQL diagnostic and hiding the useful error context.
+SQLite error offsets are UTF-8 byte offsets. The shell takes arbitrary 35-byte context slices around the offset and strictly decodes each slice. Either slice boundary can split a multibyte character, causing =UnicodeDecodeError= after the SQLite message is written but before the excerpt/caret and original APSW exception are delivered.
 
 - Direction: Convert the UTF-8 byte offset to a character offset before selecting context, or adjust byte boundaries to character boundaries. A replacement-decoding fallback can preserve the original diagnostic if exact context positioning is unavailable.
 
-- Test: Construct malformed SQL with a valid SQLite error offset and multibyte characters positioned across both 35-byte context boundaries. Verify the original SQL error and caret context are emitted without decoding failure.
+- Test: Construct malformed SQL with a valid SQLite error offset and multibyte characters positioned across both 35-byte context boundaries. Verify the original SQL error and caret context are emitted and the original APSW exception propagates without a secondary decoding failure.
 
 
 *** PY044 [LOW] .shell reports encoded POSIX wait status rather than exit code
@@ -820,16 +822,16 @@ Before every selected driver/test run, the benchmark deletes an existing =--data
 - Test: Create a sentinel file, run with its path without overwrite permission, and assert a nonzero status and unchanged contents. Repeat with explicit overwrite and verify benchmark creation succeeds.
 
 
-*** PY046 [HIGH] --data-size makes compared workloads unequal and nondeterministic
+*** PY046 [HIGH] --data-size makes compared workloads unequal and run-order-dependent
 :PROPERTIES:
 :FILE: apsw/speedtest.py
-:LINES: 137-178, 365-375, 392-412, 421-454
+:LINES: 109-139,137-301,303-375,392-454
 :CATEGORY: Benchmark correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-With =--data-size=, =number_name()= consumes global random state. No-bindings SQL materializes text during workload generation, whereas bindings SQL invokes =number_name()= during database execution. Reused binding workloads consequently generate different data across drivers and iterations, while alternating driver order changes which driver consumes each portion of random state. Timings can compare different row values, text sizes, query hits, and sorting work rather than the wrappers.
+With =--data-size=, =number_name()= consumes global random state. No-bindings SQL materializes text during workload generation, whereas bindings SQL invokes =number_name()= during database execution. Reused binding workloads consequently generate different data across drivers and iterations from mutable seeded state, while alternating driver order changes which driver consumes each portion of that state. Timings can compare different row values, text sizes, query hits, and sorting work rather than the wrappers.
 
 - Direction: Precompute one deterministic logical workload, including each generated text value, and render it as either binding parameters or SQL literals. Do not consume mutable random state through a scalar function during timed execution.
 
@@ -839,13 +841,13 @@ With =--data-size=, =number_name()= consumes global random state. No-bindings SQ
 *** PY047 [MEDIUM] Indexed lookup workloads frequently target absent or biased keys
 :PROPERTIES:
 :FILE: apsw/speedtest.py
-:LINES: 158-178, 204-220
+:LINES: 158-220,491-497
 :CATEGORY: Benchmark workload
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-Text lookup keys collected while inserting =t2= are subsequently queried against =t1.c=, so most supposed indexed point lookups miss. Numeric rowid and =a= lookups always sample =1..50001= regardless of the actual table size; small scales have substantial miss rates, while larger scales sample only an initial prefix. The lookup workload therefore changes semantics and hit distribution with scale.
+Text lookup keys collected while inserting =t2= are subsequently queried against =t1.c=, so at the default scale of 10 most supposed indexed point lookups miss. Numeric rowid and =a= lookups always sample =1..50001= regardless of the actual table size; small scales have substantial miss rates, while larger scales sample only an initial prefix. The lookup workload therefore changes semantics and hit distribution with scale.
 
 - Direction: Record keys actually inserted into =t1= and sample lookups from those keys across the intended full row range. If misses are intended, expose and document a fixed hit/miss ratio.
 
@@ -855,13 +857,13 @@ Text lookup keys collected while inserting =t2= are subsequently queried against
 *** PY048 [MEDIUM] Correctness mismatches do not fail the process
 :PROPERTIES:
 :FILE: apsw/speedtest.py
-:LINES: 345-360
+:LINES: 303-360
 :CATEGORY: Correctness reporting
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=--correctness= prints whether adjacent result sets compare equal but does not retain a failure flag, raise an error, or request a nonzero exit status. A displayed =False= comparison can therefore be followed by timing and a successful process exit. With fewer than two result sets, no comparison or diagnostic is emitted.
+=--correctness= prints whether adjacent result sets compare equal but does not retain a failure flag, raise an error, or request a nonzero exit status. A displayed =False= comparison can therefore be followed by timing and a successful process exit. With fewer than two result sets, no comparison is performed and no explicit diagnostic says that cross-result correctness was not checked.
 
 - Direction: Track comparison failures and exit nonzero after diagnostics. Emit an explicit status when there are fewer than two comparable result sets, and avoid timing after a failed gate unless continuation is explicitly requested.
 
@@ -887,7 +889,7 @@ The parser accepts any integer iteration count, but the summary unconditionally 
 *** PY050 [MEDIUM] --vfs is silently ignored by sqlite3 runs
 :PROPERTIES:
 :FILE: apsw/speedtest.py
-:LINES: 25-28, 42-55, 548-550, 620-621
+:LINES: 25-28,42-55,548-550,595-623
 :CATEGORY: Benchmark configuration
 :CONFIDENCE: High
 :STATUS: open
@@ -897,13 +899,13 @@ APSW setup passes =options.vfs= to its connection, while sqlite3 setup does not.
 
 - Direction: Reject =--vfs= for sqlite3-only runs. In mixed runs, identify the effective VFS per driver and document that the option applies only to APSW unless independently supported by sqlite3.
 
-- Test: Verify sqlite3-only plus an unavailable VFS fails during argument validation, APSW-only reports the APSW open failure, and mixed output identifies each driver’s effective VFS.
+- Test: Verify sqlite3-only plus an unavailable VFS and a non-memory database path fails during argument validation, APSW-only reports the APSW open failure, and mixed output identifies each driver’s effective VFS.
 
 
 *** PY051 [LOW] Numeric options accept invalid or meaningless configurations
 :PROPERTIES:
 :FILE: apsw/speedtest.py
-:LINES: 147-149, 490-555
+:LINES: 109-149,492-557,595-623
 :CATEGORY: Command-line validation
 :CONFIDENCE: High
 :STATUS: open
@@ -969,97 +971,97 @@ Elapsed duration is computed with =time.time()=, an adjustable wall clock. Clock
 *** PY055 [MEDIUM] `assertRaisesRoot` callable mode succeeds when no exception is raised
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: 450–455
+:LINES: 424-447
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-The callable branch at lines 450–455 returns normally if the tested callable does not raise, unlike the context-manager branch which explicitly fails. Callback, VFS, and virtual-table tests using this form can therefore remain green when an expected root exception is suppressed.
+The callable branch at lines 442–447 returns normally if the tested callable does not raise, unlike the context-manager branch which explicitly fails. Callback, VFS, and virtual-table tests using this form can therefore remain green when an expected root exception is suppressed.
 
-- Direction: : After invoking the callable, call `self.fail()` if execution returns normally. Preserve the existing root-exception traversal for raised exceptions.
+- Direction: After invoking the callable, call `self.fail()` if execution returns normally. Preserve the existing root-exception traversal for raised exceptions.
 
-- Test: : Verify that a non-raising callable causes `assertRaisesRoot(ValueError, ...)` to fail; retain passing tests for the expected root exception and failing tests for a wrong root type and chained exception.
+- Test: Verify that a non-raising callable causes `assertRaisesRoot(ValueError, ...)` to fail; verify direct and chained exceptions with the expected root type pass, while direct and chained exceptions with the wrong root type fail.
 
 
 *** PY056 [MEDIUM] Source-order checks omit required adjacent comparisons
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: 6252
+:LINES: 6079-6082,6106-6109,6146-6179,6227-6258
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-The source-order checker at line 6252 performs no comparison for two-item rules and omits the final pair in longer rules. This disables checks such as `CHECKVFSPY` before `VFSNOTIMPLEMENTED` and `FILEPREAMBLE` before `FILEPOSTAMBLE`. Correcting the bound also exposes stale `"use"` entries that are absent from several corresponding `req` mappings.
+The source-order checker at lines 6244–6249 performs no comparison for two-item rules and omits the final pair in longer rules. This disables checks such as `CHECKVFSPY` before `VFSNOTIMPLEMENTED` and `FILEPREAMBLE` before `FILEPOSTAMBLE`. Correcting the bound also exposes stale `"use"` entries that are absent from several corresponding `req` mappings.
 
-- Direction: : Iterate through `range(len(order) - 1)`. Repair or remove stale `"use"` ordering entries before enabling the comparison, and assert that every `order` key exists in `req` so configuration errors are explicit.
+- Direction: Iterate through `range(len(order) - 1)`. Repair or remove stale `"use"` ordering entries before enabling the comparison, and assert that every `order` key exists in `req` so configuration errors are explicit.
 
-- Test: : Use synthetic configurations to prove reversed two-item rules fail, a reversed final pair in a three-item rule fails, correct ordering passes, and an `order` key absent from `req` reports a clear configuration failure.
+- Test: Use synthetic configurations to prove reversed two-item rules fail, a reversed final pair in a three-item rule fails, correct ordering passes, and an `order` key absent from `req` reports a clear configuration failure.
 
 
 *** PY057 [MEDIUM] Repeated test runs overwrite an earlier failing exit status
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: 10262–10280
+:LINES: 10335-10352
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-In the repeated-run branch at lines 10262–10280, each caught `SystemExit` overwrites `exitcode`. A sequence of statuses such as `[1, 0]` exits successfully, concealing an intermittent or state-dependent failure discovered by the first iteration.
+In the repeated-run branch at lines 10335–10352, each caught `SystemExit` overwrites `exitcode`. A sequence of statuses such as `[1, 0]` exits successfully, concealing an intermittent or state-dependent failure discovered by the first iteration.
 
-- Direction: : Initialize an aggregate status before the loop and retain a nonzero result—preferably stopping on the first failure, or preserving a nonzero code across all iterations.
+- Direction: Initialize an aggregate status before the loop and retain a nonzero result—preferably stopping on the first failure, or preserving a nonzero code across all iterations.
 
-- Test: : Exercise normalized results `[1, 0]`, `[0, 1]`, and `[0, 0]`; the first two must produce nonzero overall status and the last must produce zero.
+- Test: Exercise normalized results `[1, 0]`, `[0, 1]`, and `[0, 0]`; the first two must produce nonzero overall status and the last must produce zero.
 
 
 *** PY058 [LOW] Nonpositive repeated-run counts leave the exit status uninitialized
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: 10300
+:LINES: 10346-10352,10373
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-With `APSW_TEST_ITERATIONS=0` or a negative value, the loop does not execute and `sys.exit(exitcode)` at line 10300 raises `UnboundLocalError`. This is a robustness/configuration failure distinct from overwriting an earlier failed status.
+With `APSW_TEST_ITERATIONS=0` or a negative value, the loop does not execute and `sys.exit(exitcode)` at line 10373 raises `UnboundLocalError`. This is a robustness/configuration failure distinct from overwriting an earlier failed status.
 
 - Direction: Parse the iteration count before running tests and reject values below one with a clear configuration error.
 
-- Test: : Verify that zero and negative counts fail before invoking the runner, while a positive count follows the normal aggregation path.
+- Test: Verify that zero and negative counts fail before invoking the runner, while a positive count follows the normal aggregation path.
 
 
 *** PY059 [MEDIUM] `assertTablesEqual` compares the left schema with itself
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: apsw/tests/shelltest.py:74–75; 489–491; 3828 and 3833; 1555
+:LINES: apsw/tests/__main__.py:470-489,3820,3825; apsw/tests/shelltest.py:63-82,1555
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-At lines 489–491, the right connection executes `PRAGMA table_info` using `left` rather than `right`. The helper consequently verifies row count and values but not right-hand column names. The affected `__main__.py` calls at lines 3828 and 3833 can miss schema-name preservation regressions. The same copied root exists in `apsw/tests/shelltest.py:74–75`, where the `.autoimport` comparison at line 1555 can similarly accept incorrect imported column names despite matching rows.
+At lines 480–482, the right connection executes `PRAGMA table_info` using `left` rather than `right`. The helper consequently verifies row count and values but not right-hand column names. The affected `__main__.py` calls at lines 3820 and 3825 can miss schema-name preservation regressions. The same copied root exists in `apsw/tests/shelltest.py:74–75`, where the `.autoimport` comparison at line 1555 can similarly accept incorrect imported column names despite matching rows.
 
-- Direction: : Change the right-hand query in both copies to use `right`, or factor the comparison into one shared helper so the invariant has a single implementation.
+- Direction: Change the right-hand query in both copies to use `right`, or factor the comparison into one shared helper so the invariant has a single implementation.
 
-- Test: : Compare tables with identical rows but different column names and assert failure; include matching-schema success and differing column-order failure cases in both helper contexts.
+- Test: In both helper contexts, use one connection containing two differently named tables. Compare identical rows with different column names and assert failure; retain matching-schema success and differing column-order failure cases.
 
 
 *** PY060 [LOW] `testSanity` discards a mapping consistency comparison
 :PROPERTIES:
 :FILE: apsw/tests/__main__.py
-:LINES: 559
+:LINES: 541-551
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-Line 559 evaluates whether `mapping_file_control["SQLITE_FCNTL_SIZE_HINT"]` equals `SQLITE_FCNTL_SIZE_HINT` and discards the resulting boolean. A future constants-generation mismatch would leave this sanity check green.
+Line 551 evaluates whether `mapping_file_control["SQLITE_FCNTL_SIZE_HINT"]` equals `SQLITE_FCNTL_SIZE_HINT` and discards the resulting boolean. A future constants-generation mismatch would leave this sanity check green.
 
-- Direction: : Replace the bare expression with `self.assertEqual(...)`.
+- Direction: Replace the bare expression with `self.assertEqual(...)`.
 
-- Test: : Validate the extracted check or temporarily substitute a mismatched mapping value and confirm that the sanity test fails.
+- Test: Validate the extracted check or temporarily substitute a mismatched mapping value and confirm that the sanity test fails.
 
 ** apsw/tests/shelltest.py
 
@@ -1074,15 +1076,15 @@ Line 559 evaluates whether `mapping_file_control["SQLITE_FCNTL_SIZE_HINT"]` equa
 
 The condition at line 1658 checks `load_rxtension`, which does not exist. The entire `.load` test block is therefore skipped even on builds exposing `Connection.load_extension`, omitting shell command parsing, diagnostics, alternate entry points, and successful extension loading.
 
-- Direction: : Check `hasattr(s.db, "load_extension")`. Keep argument-count checks independent of the optional extension artifact, and narrowly skip only positive loading cases when that artifact is unavailable.
+- Direction: Check `hasattr(s.db, "load_extension")`. Keep argument-count checks independent of the optional extension artifact, and narrowly skip only positive loading cases when that artifact is unavailable.
 
-- Test: : On an extension-enabled build, cover no/too-many argument diagnostics, missing-file behavior, alternate entry-point loading, normal loading, and resulting SQL functions. Verify targeted skipping when the test extension artifact is absent.
+- Test: On an extension-enabled build, cover no/too-many argument diagnostics, missing-file behavior, alternate entry-point loading, normal loading, and resulting SQL functions. Verify targeted skipping when the test extension artifact is absent.
 
 
 *** PY062 [MEDIUM] Expected-error paths pass when `shellclass.Error` is not raised
 :PROPERTIES:
 :FILE: apsw/tests/shelltest.py
-:LINES: 133–174
+:LINES: 133-174
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1090,15 +1092,15 @@ The condition at line 1658 checks `load_rxtension`, which does not exist. The en
 
 The invalid `.read`, missing `-init` filename, direct `--init`, unknown option, and invalid init-file cases at lines 133–174 catch `shellclass.Error` but contain no `else`, `fail`, or `assertRaises`. A regression that returns normally instead of raising leaves each test green and also skips its diagnostic assertion.
 
-- Direction: : Use `assertRaises` or `assertRaisesRegex`, with separate assertions for captured diagnostics where output is part of the contract.
+- Direction: Use `assertRaises` or `assertRaisesRegex`, with separate assertions for captured diagnostics where output is part of the contract.
 
-- Test: : For each path, assert the required exception and diagnostic; exercise the assertion helper with a deliberately non-raising substitute to prove normal return fails the test.
+- Test: For each path, assert the required exception and diagnostic; exercise the assertion helper with a deliberately non-raising substitute to prove normal return fails the test.
 
 
 *** PY063 [LOW] Invalid-encoding `.autoimport` diagnostic fixture is skipped
 :PROPERTIES:
 :FILE: apsw/tests/shelltest.py
-:LINES: 1604–1608; 1610–1611
+:LINES: 1604-1608; 1610-1611
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1106,15 +1108,15 @@ The invalid `.read`, missing `-init` filename, direct `--init`, unknown option, 
 
 The malformed UTF-8 fixture at lines 1604–1608 is the sole `"current encoding"` case, but the loop skips all `bytes` content at lines 1610–1611. The intended decoding-error diagnostic and no-destination-table behavior receive no coverage.
 
-- Direction: : Write byte fixtures with `Path.write_bytes()` and text fixtures with `write_text(..., encoding="utf8")`, then run the existing assertions for both.
+- Direction: Write byte fixtures with `Path.write_bytes()` and text fixtures with `write_text(..., encoding="utf8")`, then run the existing assertions for both.
 
-- Test: : Write the malformed byte sequence under strict UTF-8, run `.autoimport`, assert the `"current encoding"` diagnostic, and verify that no destination table remains.
+- Test: Write the malformed byte sequence under strict UTF-8, run `.autoimport`, assert the `"current encoding"` diagnostic, and verify that no destination table remains.
 
 
 *** PY064 [LOW] `ResourceWarning` suppression has execution-context-dependent global scope
 :PROPERTIES:
 :FILE: apsw/tests/shelltest.py
-:LINES: 48–50; 1244
+:LINES: 48-50; 1244
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1122,16 +1124,16 @@ The malformed UTF-8 fixture at lines 1604–1608 is the sole `"current encoding"
 
 `suppress_warning()` at lines 48–50 mutates global warning filters when `__builtins__` is a module, and the call at line 1244 never restores them. Under ordinary aggregate CPython import, `__builtins__` is normally a dictionary and the intended suppression does nothing; under direct/module execution it can suppress `ResourceWarning` for the rest of the process. The standard shared-suite global-leak claim is therefore not established, but behavior is inconsistent and direct execution can hide later warnings.
 
-- Direction: : Avoid dynamic `__builtins__` probing. Scope suppression with `warnings.catch_warnings()` around only the operation that requires it, or eliminate the warning source by closing the resource.
+- Direction: Avoid dynamic `__builtins__` probing. Scope suppression with `warnings.catch_warnings()` around only the operation that requires it, or eliminate the warning source by closing the resource.
 
-- Test: : Snapshot `warnings.filters`, run the relevant operation, and assert restoration. After the scoped operation, promote a sentinel `ResourceWarning` to an error and confirm it is still raised under both ordinary import and direct execution.
+- Test: Install a sentinel `ResourceWarning` error filter and snapshot `warnings.filters` before the relevant operation; assert exact restoration afterward, then emit the sentinel warning and confirm it is still raised under both ordinary import and direct execution.
 
 ** apsw/tests/aiotest.py
 
 *** PY065 [MEDIUM] `testOverwrite` leaves `apsw.async_run_coro` modified on the runner thread
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 61–65
+:LINES: 61-65
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1139,15 +1141,15 @@ The malformed UTF-8 fixture at lines 1604–1608 is the sole `"current encoding"
 
 Lines 61–65 replace `apsw.async_run_coro` with a lambda and provide no cleanup. The value is stored in the current thread state, so it remains installed on the unittest runner thread. Repeated in-process execution fails deterministically on the next iteration and subsequent same-thread tests can observe the fake coroutine runner.
 
-- Direction: : Save the original value and restore it unconditionally in `finally` or registered cleanup.
+- Direction: Save the original value and restore it unconditionally in `finally` or registered cleanup.
 
-- Test: : Run the test twice on one thread, or assert after one run that the slot equals its original value. Verify `APSW_TEST_ITERATIONS=2` reaches the second iteration without failing its initial `assertIsNone`.
+- Test: Run the test twice on one thread, or assert after one run that the slot equals its original value. Verify `APSW_TEST_ITERATIONS=2` reaches the second iteration without failing its initial `assertIsNone`.
 
 
 *** PY066 [LOW] `allow_missing_dict_bindings` is restored to a hard-coded value
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 595–596; 744–747
+:LINES: 595-596; 744-747
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1155,15 +1157,15 @@ Lines 61–65 replace `apsw.async_run_coro` with a lambda and provide no cleanup
 
 The test enables missing dictionary bindings at lines 595–596 but always restores `False` at lines 744–747. A focused or programmatic run entered with the option already enabled changes caller state on exit.
 
-- Direction: : Preserve the return value from `allow_missing_dict_bindings(True)` and restore that exact prior value in cleanup.
+- Direction: Preserve the return value from `allow_missing_dict_bindings(True)` and restore that exact prior value in cleanup.
 
-- Test: : Start with the option enabled, execute the relevant test path including an exception path, and confirm it remains enabled afterward.
+- Test: Start with the option enabled, execute the relevant test path including an exception path, and confirm it remains enabled afterward.
 
 
 *** PY067 [LOW] Best-practice test cleanup replaces all pre-existing connection hooks
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 776–778; 785–786
+:LINES: 776-778; 785-786
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1171,15 +1173,15 @@ The test enables missing dictionary bindings at lines 595–596 but always resto
 
 The test applies recommended best practices at lines 776–778, appending a hook, then assigns `apsw.connection_hooks = []` at lines 785–786. This removes caller-installed hooks and replaces the original list object in focused or embedded execution.
 
-- Direction: : Preserve both the original list object and contents, restoring them in place, or remove only the hook installed by this test.
+- Direction: Preserve both the original list object and contents, restoring them in place, or remove only the hook installed by this test.
 
-- Test: : Install a sentinel hook in a retained list, run the test, and verify the sentinel and original list identity remain while the temporary best-practice hook is removed.
+- Test: Install a sentinel hook in a retained list, run the test, and verify the sentinel and original list identity remain while the temporary best-practice hook is removed.
 
 
 *** PY068 [MEDIUM] Optional dependency version parsing rejects valid PEP 440 release spellings
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 1350, 1379
+:LINES: 1350,1379,1396
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1187,15 +1189,15 @@ The test applies recommended best practices at lines 776–778, appending a hook
 
 The Trio and AnyIO gates at lines 1350, 1379, and 1396 apply `tuple(map(int, version.split(".")))`. Valid local and post releases such as `0.31.0+vendor` and `4.11.0.post1` raise `ValueError`; abbreviated stable versions such as `4` compare incorrectly with `4.0`. Optional backend coverage can error or skip based solely on distributor version spelling. Prerelease handling requires an explicit policy because prereleases ordinarily sort below a final minimum.
 
-- Direction: : Prefer API capability checks, or adopt a declared PEP 440-aware version dependency/parser with documented prerelease policy.
+- Direction: Prefer API capability checks, or adopt a declared PEP 440-aware version dependency/parser with documented prerelease policy.
 
-- Test: : Mock version values for abbreviated, local, post, prerelease, and genuinely older releases; assert intended run/skip behavior and no parsing failure.
+- Test: Mock version values for abbreviated, local, post, prerelease, and genuinely older releases; assert intended run/skip behavior and no parsing failure.
 
 
 *** PY069 [MEDIUM] Effective-deadline assertions accept incorrect deadline propagation
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 969–980
+:LINES: 969-980
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1203,15 +1205,15 @@ The Trio and AnyIO gates at lines 1350, 1379, and 1396 apply `tuple(map(int, ver
 
 At lines 969–980, any AnyIO run accepts an infinite effective deadline, although current dedicated AnyIO controllers should provide one. The finite assertion only rejects deadlines more than one second late; a substantially early deadline passes. Regressions in timeout propagation or controller selection can therefore be hidden.
 
-- Direction: : Permit infinity only for the documented fallback controller that lacks native AnyIO deadline extraction, and compare finite deadlines with an absolute one-second tolerance.
+- Direction: Permit infinity only for the documented fallback controller that lacks native AnyIO deadline extraction, and compare finite deadlines with an absolute one-second tolerance.
 
-- Test: : Assert failure for infinity under the dedicated AnyIO controller and for a substantially early future deadline; retain passing cases for the documented fallback and small positive/negative rounding differences.
+- Test: Assert failure for infinity under the dedicated AnyIO controller and for a substantially early future deadline; retain passing cases for the documented fallback and small positive/negative rounding differences.
 
 
 *** PY070 [LOW] Async tests rely on private unittest result internals
 :PROPERTIES:
 :FILE: apsw/tests/aiotest.py
-:LINES: 52–54
+:LINES: 52-54
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1219,16 +1221,16 @@ At lines 969–980, any AnyIO run accepts an infinite effective deadline, althou
 
 Lines 52–54 read `self._outcome.result.showAll`. Plain `unittest.TestResult`, `TestCase.debug()`, and valid custom runners need not expose `showAll`, so setup can fail before any async test executes.
 
-- Direction: : Default verbosity safely with guarded lookup, or pass project verbosity through supported configuration rather than reading private unittest state.
+- Direction: Default verbosity safely with guarded lookup, or pass project verbosity through supported configuration rather than reading private unittest state.
 
-- Test: : Run an `Async` case using plain `unittest.TestResult()` and through `debug()`, then retain a verbose text-runner case for optional diagnostics.
+- Test: Run an `Async` case using plain `unittest.TestResult()` and through `debug()`, then retain a verbose text-runner case for optional diagnostics.
 
 ** apsw/tests/async_meta.py
 
 *** PY071 [LOW] Async metadata verification is absent from ordinary suite entry points
 :PROPERTIES:
 :FILE: apsw/tests/async_meta.py
-:LINES: 249-250; apsw/tests/__main__.py:10239-10245; setup.py:179-187; tools/megatest.py:66-73; tools/coverage.sh:63
+:LINES: apsw/tests/async_meta.py:257-258; apsw/tests/__main__.py:10312-10318; setup.py:179-187; tools/megatest.py:66-73; tools/coverage.sh:65
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1236,15 +1238,15 @@ Lines 52–54 read `self._outcome.result.showAll`. Plain `unittest.TestResult`, 
 
 `AsyncMeta.testMetaJson` is absent from the `apsw.tests.__main__` import block, so normal test runs, `setup.py test`, megatest, and wheel smoke tests do not validate runtime async classifications against `async_meta.json`. The dedicated coverage script does run it under a Session-enabled build, so this is an ordinary-suite gap rather than a complete absence of project coverage.
 
-- Direction: : Add a feature-aware verifier to the normal/CI paths after handling unavailable Session support and controller cleanup, or explicitly invoke the separate module in megatest and release-relevant workflows.
+- Direction: Add a feature-aware verifier to the normal/CI paths after handling unavailable Session support and controller cleanup, or explicitly invoke the separate module in megatest and release-relevant workflows.
 
-- Test: : Load the normal suite and assert it contains `AsyncMeta.testMetaJson`; introduce a deliberately mismatched metadata entry and verify the chosen normal or CI command fails.
+- Test: Load the normal suite and assert it contains `AsyncMeta.testMetaJson`; introduce a deliberately mismatched metadata entry and verify the chosen normal or CI command fails.
 
 
 *** PY072 [MEDIUM] Worker-side attribute classification does not await queued requests
 :PROPERTIES:
 :FILE: apsw/tests/async_meta.py
-:LINES: 91–104; 225–231
+:LINES: 91-104,225-231,257-258,372-377,420-462
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1252,15 +1254,15 @@ Lines 52–54 read `self._outcome.result.showAll`. Plain `unittest.TestResult`, 
 
 At lines 91–104, `classifyOne()` calls `send()` for worker-side attribute access and immediately returns `"value"`. `send()` only queues a request; worker exceptions are delivered when its request is awaited. In contrast, method classification at lines 225–231 awaits its request. A worker-only getter failure can therefore be accepted as a usable value and its exception is lost.
 
-- Direction: : Await every request returned by `send()` and apply the same expected-exception classification rules used by the method path. If writable attributes are intended to be tested in the worker, route the actual writable-attribute validation through the corrected setter path.
+- Direction: Await every request returned by `send()` and apply the same expected-exception classification rules used by the method path. If writable attributes are intended to be tested in the worker, route the actual writable-attribute validation through the corrected setter path.
 
-- Test: : Use a fake property getter that raises only in the worker thread and verify classification propagates or explicitly records the failure rather than returning `"value"`.
+- Test: Use a fake property getter that raises only in the worker thread and verify classification propagates or explicitly records the failure rather than returning `"value"`.
 
 
 *** PY073 [LOW] Runtime metadata verification unconditionally requires Session support
 :PROPERTIES:
 :FILE: apsw/tests/async_meta.py
-:LINES: 62-64,216-223,252-261,296-306; apsw/aio.py:133-139
+:LINES: 62-64,216-223,257-266,304-306; apsw/aio.py:133-139
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
@@ -1268,25 +1270,25 @@ At lines 91–104, `classifyOne()` calls `send()` for worker-side attribute acce
 
 `Session` is always included in the metadata/runtime object set and the test unconditionally calls `apsw.aio.make_session()`, which rejects builds without `SQLITE_ENABLE_SESSION`. The separate coverage invocation enables Session, and the normal suite does not currently import this module, limiting present impact; nevertheless direct execution on supported no-Session builds cannot validate the remaining asyncable classes and this blocks broad suite integration.
 
-- Direction: : Retain static Session metadata, but skip only Session runtime introspection and Session-only constants when the build lacks `apsw.Session`, clearly reporting the feature-based skip.
+- Direction: Retain static Session metadata, but skip only Session runtime introspection and Session-only constants when the build lacks `apsw.Session`, clearly reporting the feature-based skip.
 
-- Test: : Run on a no-Session build and assert Connection, Cursor, Blob, and Backup validation succeeds while Session is skipped; retain full Session validation on a Session-enabled build.
+- Test: Run on a no-Session build and assert Connection, Cursor, Blob, and Backup validation succeeds while Session is skipped; retain full Session validation on a Session-enabled build.
 
 
 *** PY074 [LOW] `apsw.async_controller` is not restored after metadata testing
 :PROPERTIES:
 :FILE: apsw/tests/async_meta.py
-:LINES: 249–250
+:LINES: 258
 :CATEGORY: test correctness / false confidence
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-At lines 249–250, the test installs `SimpleController` in `apsw.async_controller` without a matching reset. Later connections in the same context can select the blocking test controller. Current coverage normally runs this module in its own process, but programmatic loading or normal-suite integration makes behavior order-dependent.
+At line 258, the test installs `SimpleController` in `apsw.async_controller` without a matching reset. Later connections in the same context can select the blocking test controller. Current coverage normally runs this module in its own process, but programmatic loading or normal-suite integration makes behavior order-dependent.
 
-- Direction: : Scope the value with `apsw.aio.contextvar_set(...)`, or register immediate cleanup using the token returned by `set()`.
+- Direction: Scope the value with `apsw.aio.contextvar_set(...)`, or register immediate cleanup using the token returned by `set()`.
 
-- Test: : Set a sentinel controller, run the test on both success and injected-failure paths, and verify the sentinel is restored afterward.
+- Test: Set a sentinel controller, run the test on both success and injected-failure paths, and verify the sentinel is restored afterward.
 
 ** apsw/tests/carray.py
 
@@ -1374,7 +1376,7 @@ The =fsdir= loop requires every returned =data= value to equal the file blob. SQ
 *** PY080 [MEDIUM] SQLAR command failures and crashes are accepted
 :PROPERTIES:
 :FILE: apsw/tests/extratest.py
-:LINES: 91-97
+:LINES: 91-97,176-186
 :CATEGORY: Subprocess validation
 :CONFIDENCE: High
 :STATUS: open
@@ -1423,7 +1425,7 @@ On OpenBSD, the helper skips =check_returncode()= for commands not expecting std
 *** PY083 [MEDIUM] Fork-violation checks succeed even when no violation is observed
 :PROPERTIES:
 :FILE: apsw/tests/fork_checker.py
-:LINES: 96-111,124-127
+:LINES: 96-111,120-127
 :CATEGORY: Test oracle
 :CONFIDENCE: High
 :STATUS: open
@@ -1439,7 +1441,7 @@ Expected =ForkingViolationError= instances are swallowed without recording wheth
 *** PY084 [MEDIUM] testManyConnections runs after the checker has been disabled
 :PROPERTIES:
 :FILE: apsw/tests/fork_checker.py
-:LINES: 19-23,144-148
+:LINES: apsw/tests/fork_checker.py:19-23,32-43,144-148; src/apsw.c:537-545,1323-1329
 :CATEGORY: Test lifecycle
 :CONFIDENCE: High
 :STATUS: open
@@ -1635,7 +1637,7 @@ Conversion tests set the current decimal context precision to 128 and do not res
 *** PY096 [MEDIUM] Unbounded retention and duplication of statement timings
 :PROPERTIES:
 :FILE: apsw/trace.py
-:LINES: 108-113, 208-221, 353-357, 368
+:LINES: 108-113, 208-221, 353-365, 368
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -1671,7 +1673,7 @@ Exercise hook ordering before and after the tracer with execution, row, and prof
 *** PY098 [MEDIUM] Target executes in the tracer's existing =__main__= namespace
 :PROPERTIES:
 :FILE: apsw/trace.py
-:LINES: 193-200
+:LINES: 193-200,370-395
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -1680,7 +1682,7 @@ Exercise hook ordering before and after the tracer with execution, row, and prof
 The target is compiled and executed in =vars(__main__)= while =__main__= remains the module created for =apsw.trace=. The target therefore inherits tracer metadata and globals, including an incorrect =__file__=, =__package__ == "apsw"=, the tracer =__spec__=, and tracer implementation names. This differs from normal =python target.py= semantics and can break resource lookup, package/import behavior, or code that imports =__main__=.
 
 - Direction:
-Run the target with real script semantics, such as =runpy.run_path(..., run_name="__main__")=, or construct a clean main-module namespace with target =__file__=, =__name__ = "__main__"=, =__package__ = None=, =__spec__ = None=, and appropriate module metadata.
+Run the target with real script semantics, using a clean temporary =__main__= module with target =__file__=, =__name__ = "__main__"=, =__package__ = None=, =__spec__ = None=, and appropriate module metadata; verify any =runpy= based implementation also gives =import __main__= that same clean namespace.
 
 - Test:
 Trace a script that verifies its own =__file__=, requires =__package__= and =__spec__= to be =None=, imports =__main__= to inspect the same metadata, confirms tracer globals are absent, and opens a resource relative to its file. Compare its behavior with direct script execution.
@@ -1869,17 +1871,17 @@ Add a static typing fixture that unpacks =start=, =end=, and =word= and verifies
 
 *** PY109 [LOW] =grapheme_find= documentation contradicts empty-needle behavior
 :PROPERTIES:
-:FILE: apsw/unicode.py
-:LINES: 397-406
-:CATEGORY: correctness
+:FILE: apsw/unicode.py, src/unicode.c, apsw/tests/ftstests.py
+:LINES: apsw/unicode.py:397-406; src/unicode.c:1685-1759; apsw/tests/ftstests.py:2459-2521
+:CATEGORY: Documentation / API contract
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-The public documentation says a zero-length substring returns =-1=, while the C implementation and existing tests implement =str.find()=-like empty-needle behavior. Users following the documentation therefore receive results contrary to the stated contract. The precise treatment of arbitrary starts inside a multi-codepoint grapheme should be decided before documenting a boundary-specific rule.
+The public documentation says a zero-length substring returns =-1=, but the C implementation often returns the normalized start offset. It special-cases =start == 0= even for some excluded ranges, and otherwise accepts the initial start candidate without establishing that it is a grapheme boundary. Existing tests compare against =str.find()= only for simple strings; empty-needle behavior for starts inside multi-codepoint graphemes is not covered. Users following the documentation therefore receive results contrary to the stated contract.
 
 - Direction:
-Choose and document the intended empty-needle contract. If =str.find()= compatibility is intended, remove the zero-length exclusion and document range behavior. If only grapheme-boundary matches are intended, validate initial offsets in the C implementation and adjust tests.
+Choose and document the intended empty-needle contract. If =str.find()= compatibility is intended, remove the zero-length exclusion and make range normalization fully compatible. If only grapheme-boundary matches are intended, validate the initial start offset and document the boundary-specific semantics.
 
 - Test:
 Test an empty needle at the beginning, inside, and end of a multi-codepoint grapheme, including restricted and negative end values. Verify the selected contract is stable and documented.
@@ -1944,7 +1946,7 @@ Load the configuration or run a minimal Sphinx build with both variables present
 *** PY113 [HIGH] Python 3.10 cannot parse the TaskGroup cancellation example
 :PROPERTIES:
 :FILE: examples/async.py
-:LINES: examples/async.py:169; 189
+:LINES: 166-192
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -1964,7 +1966,7 @@ Run `python3.10 -m py_compile examples/async.py`; execute the cancellation demon
 *** PY114 [LOW] Backup connections lack deterministic exception-safe cleanup
 :PROPERTIES:
 :FILE: examples/async.py
-:LINES: 579–590; 625–627
+:LINES: 579-590; 625-627
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -1984,7 +1986,7 @@ Inject a `Backup.step()` failure after all connections are created and retain it
 *** PY115 [LOW] The second timeout reports cumulative rather than local elapsed time
 :PROPERTIES:
 :FILE: examples/async.py
-:LINES: 270; 280–283; 284–287
+:LINES: 270; 280-283; 284-287
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2025,7 +2027,7 @@ Capture the session-section output and verify the estimate line contains an inte
 *** PY117 [LOW] Standalone execution depends on a non-shipped fixture and can create an empty database
 :PROPERTIES:
 :FILE: examples/fts.py
-:LINES: 27–29; 33–38; 232–235
+:LINES: 27-29; 33-38; 232-235
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2045,7 +2047,7 @@ From an empty temporary directory, verify a clear prerequisite error and no data
 *** PY118 [LOW] Empty FTS results leave the first result variable undefined
 :PROPERTIES:
 :FILE: examples/fts.py
-:LINES: 151–163
+:LINES: 151-163
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2065,7 +2067,7 @@ Use one FTS fixture with no matching terms and assert the controlled no-results 
 *** PY119 [LOW] The custom tokenizer accepts zero and negative block sizes
 :PROPERTIES:
 :FILE: examples/fts.py
-:LINES: 613–620; 627–635
+:LINES: 613-620; 627-635
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2084,8 +2086,8 @@ Exercise `block=0`, `block=-1`, `block=1`, and `block=5`; invalid values should 
 
 *** PY120 [LOW] The custom tokenizer factory has an incorrect return annotation
 :PROPERTIES:
-:FILE: examples/fts.py
-:LINES: 607–610; 627–637
+:FILE: examples/fts.py, apsw/fts5.py, src/apswtypes.py
+:LINES: examples/fts.py:607-610,627-637; apsw/fts5.py:243-265; src/apswtypes.py:143-148
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2093,10 +2095,10 @@ Exercise `block=0`, `block=-1`, `block=1`, and `block=5`; invalid values should 
 
 `atokenizer` is annotated as returning `apsw.FTS5Tokenizer` at lines 607–610, but lines 627–637 return a nested string-tokenizing Python callback.  The APSW wrapper type is instead returned by `Connection.fts5_tokenizer()`.
 
-The instructional type annotation gives readers and static analyzers the wrong contract for the decorator callback.
+The instructional annotation gives readers and static analyzers the wrong contract for the decorator callback. The related =StringTokenizer= decorator is also declared as returning =apsw.Tokenizer= at =apsw/fts5.py:243-265= although it returns a tokenizer factory, reflecting the lack of a precise public string-tokenizer callback/factory contract.
 
 - Direction:
-Remove the local return annotation or annotate the callback as a callable accepting `(str, int, str | None)` and yielding `(start, end, token)` tuples.  Consider a public callback protocol if library typing is expanded.
+Remove the local return annotation, or define a public string-tokenizer callback/factory contract and annotate the callback as accepting =(str, int, str | None)= and yielding =(start, end, token)= tuples; declare =StringTokenizer= as returning =apsw.FTS5TokenizerFactory=.
 
 - Test:
 Add a type-checking fixture for the decorated factory and retain a runtime registration test that verifies tokens and UTF-8 offsets.
@@ -2126,7 +2128,7 @@ Run the complete example on Python 3.10 through 3.14.  Verify callbacks observe 
 *** PY122 [LOW] Tagged-object decoding is overbroad
 :PROPERTIES:
 :FILE: examples/json.py
-:LINES: 194–203
+:LINES: 194-203
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2146,7 +2148,7 @@ Verify unknown tags remain dictionaries; malformed or extra-field complex-tagged
 *** PY123 [LOW] The introductory typing comment falsely says postponed annotations are mandatory
 :PROPERTIES:
 :FILE: examples/json.py
-:LINES: 3–6
+:LINES: 3-6
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2167,13 +2169,13 @@ Optionally compile the definitions without the future import on Python 3.10 and 
 *** PY124 [HIGH] Fixed working-directory database names can alter or delete user data
 :PROPERTIES:
 :FILE: examples/main.py
-:LINES: 65–75; 1218–1243; 248–254; 489–502
+:LINES: examples/main.py:65-75,1218-1243; examples/session.py:248-254,489-502; Makefile:74-83; tools/fi.py:780-795
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-`examples/main.py` opens or creates `dbfile` at lines 65–75, modifies it extensively, and later opens `myobfudb`, writes it, and unconditionally deletes its pathname at lines 1218–1243.  `examples/session.py` similarly backs into `alice.db` and `bob.db` at lines 248–254 and creates tables in `diff_demo.db` and attached `other.db` at lines 489–502.  The Makefile and fault-injection tool work around both examples by deleting or rewriting these names, but direct execution remains unprotected.
+`examples/main.py` opens or creates `dbfile` at lines 65–75, modifies it extensively, and later opens `myobfudb`, writes it, and unconditionally deletes its pathname at lines 1218–1243.  `examples/session.py` similarly backs up into `alice.db` and `bob.db` at lines 248–254 and creates tables in `diff_demo.db` and attached `other.db` at lines 489–502.  The Makefile and fault-injection tool work around both examples by deleting or rewriting these names, but direct execution remains unprotected.
 
 Direct execution can modify an unrelated `dbfile`, overwrite pre-existing backup destinations, delete a compatible pre-existing `myobfudb`, leave artifacts, and make later runs non-idempotent.  The filename-based Makefile cleanup can itself delete unrelated same-named files in its working directory.
 
@@ -2187,7 +2189,7 @@ Run both examples twice in temporary working directories containing sentinel fil
 *** PY125 [MEDIUM] Complex-number conversion fails for valid values
 :PROPERTIES:
 :FILE: examples/main.py
-:LINES: 512–535
+:LINES: 512-535
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2207,7 +2209,7 @@ Round-trip ordinary values, positive and negative scientific exponents, signed z
 *** PY126 [MEDIUM] Symlink-following filesystem traversal can recurse through cycles
 :PROPERTIES:
 :FILE: examples/main.py
-:LINES: 1052–1069
+:LINES: 1052-1069
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2238,10 +2240,10 @@ The section says it finds the three oldest Python files, but its SQL orders `ORD
 The output contradicts the stated purpose and teaches an incorrect query.
 
 - Direction:
-Order by an explicitly named time metric, such as `st_mtime ASC` for oldest modification time, and label that metric accurately.
+Order by =st_ctime ASC= and label it earliest metadata-change time, or consistently select, display, and order =st_mtime= for the ordinary “oldest files” meaning.
 
 - Test:
-Use synthetic rows whose size and modification-time order differ; assert the query selects the three earliest timestamps regardless of size.
+Use synthetic rows whose size, metadata-change time, and modification-time orders differ; assert the query selects the three earliest values of the chosen and accurately labelled timestamp regardless of size.
 
 
 *** PY128 [LOW] Incremental blob cleanup is not exception-safe
@@ -2267,7 +2269,7 @@ Raise an exception within the block, retain the blob object, verify it is closed
 *** PY129 [LOW] Trace callback puts required mutations inside an assertion
 :PROPERTIES:
 :FILE: examples/main.py
-:LINES: 1357–1365
+:LINES: 1357-1365
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2288,7 +2290,7 @@ Run the callback normally and with `python -O`; in both modes verify `sql` and `
 *** PY130 [MEDIUM] Bundled SQL is resolved from the process working directory
 :PROPERTIES:
 :FILE: examples/session.py
-:LINES: 33 and 450
+:LINES: 33,450
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2308,7 +2310,7 @@ Invoke the script by absolute path with repository-root, `examples/`, and unrela
 *** PY131 [LOW] Session availability is reported but Session APIs are still used unconditionally
 :PROPERTIES:
 :FILE: examples/session.py
-:LINES: 20–22; 43
+:LINES: 20-22; 43
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2328,7 +2330,7 @@ Run once with Session support and once without it.  Verify the enabled build com
 *** PY132 [LOW] The rebased changeset is computed but never demonstrated or applied
 :PROPERTIES:
 :FILE: examples/session.py
-:LINES: 440–441; 478–481
+:LINES: 440-441; 478-481
 :CATEGORY: example correctness / safety
 :CONFIDENCE: High
 :STATUS: open
@@ -2409,13 +2411,13 @@ Place a sentinel in an existing =sqlite3/= tree, inject download and extraction 
 *** PY136 [MEDIUM] Extension-test markers are invisible to in-process tests
 :PROPERTIES:
 :FILE: setup.py
-:LINES: setup.py:615; setup.py:678; apsw/tests/__main__.py:3844-3852
+:LINES: setup.py:615,678; apsw/tests/__main__.py:3843-3844
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-Build finalization uses =os.putenv("APSW_TEST_" + e.upper(), "1")= at =setup.py:615= and =os.putenv("APSW_TEST_ICU", "1")= at =setup.py:678=. Tests inspect =os.environ= at =apsw/tests/__main__.py:3844-3852=. Direct =os.putenv()= does not update Python’s existing =os.environ= mapping. The release validation and megatest paths chain build and test commands in the same setup process.
+Build finalization uses =os.putenv("APSW_TEST_" + e.upper(), "1")= at =setup.py:615= and =os.putenv("APSW_TEST_ICU", "1")= at =setup.py:678=. Tests inspect =os.environ= at =apsw/tests/__main__.py:3843-3844=. Direct =os.putenv()= does not update Python’s existing =os.environ= mapping. The release validation and megatest paths chain build and test commands in the same setup process.
 
 An explicitly enabled extension can be absent or misbuilt while in-process tests continue treating it as optional.
 
@@ -2449,7 +2451,7 @@ Run successful and failing =sdist= operations with both an existing custom file 
 *** PY138 [LOW] =--missing-checksum-ok= does not apply to the amalgamation
 :PROPERTIES:
 :FILE: setup.py
-:LINES: setup.py:294; setup.py:340
+:LINES: setup.py:294,323,340
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -2469,7 +2471,7 @@ Mock a version absent from =checksums=. Verify source and amalgamation fetch suc
 *** PY139 [MEDIUM] No-old-names stub customization mutates the source tree
 :PROPERTIES:
 :FILE: setup.py
-:LINES: setup.py:432-442; setup.py:544
+:LINES: setup.py:432-442,541-544; apsw/__init__.pyi:1; Makefile:103-104,153-156; tools/gendocstrings.py:727-741,961
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -2510,18 +2512,18 @@ Use fake helpers that separately fail flags, fail libraries, fail both, return e
 *** PY141 [MEDIUM] =Self= and =Buffer= imports exceed supported typing targets
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:3-4
+:LINES: src/apswtypes.py:3-4,9,50,61,89,92,98,137,150,159,163; apsw/__init__.pyi:4-5
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=src/apswtypes.py:3-4= imports =typing.Self= and =collections.abc.Buffer=, and the generated stub copies both imports. The package declares =python_requires=">=3.10"=, but =Self= is unavailable for the Python 3.10 typing target and =Buffer= is unavailable for Python 3.10 and 3.11. Stub imports are not normal =import apsw= runtime imports, so the effect is type-checking compatibility rather than a runtime import failure.
+=src/apswtypes.py:3-4= imports =typing.Self= and =collections.abc.Buffer=, and the generated stub copies both imports. The package declares =python_requires=">=3.10"=, but =Self= is unavailable for the Python 3.10 typing target and =Buffer= is unavailable for Python 3.10 and 3.11. The declarations also use starred variadic typing syntax that is not compatible with all supported Python 3.10 checker targets.
 
 Type checking on supported Python 3.10/3.11 targets can report unavailable imports or fail to resolve central aliases such as =SQLiteValue=.
 
 - Direction:
-Use a declared =typing_extensions= dependency and import the required backports appropriately in =src/apswtypes.py=, then regenerate the stub.
+Use a declared =typing_extensions= dependency and import the required backports appropriately in =src/apswtypes.py=; also use Python-3.10-compatible =Unpack= spellings for starred variadic aliases, then regenerate the stub.
 
 - Test:
 Run supported mypy and pyright versions targeting Python 3.10, 3.11, and 3.12+ against a program importing =apsw= and annotating =apsw.SQLiteValue=. Assert no diagnostic originates from unavailable APSW stub imports.
@@ -2530,7 +2532,7 @@ Run supported mypy and pyright versions targeting Python 3.10, 3.11, and 3.12+ a
 *** PY142 [MEDIUM] Window =step= and =inverse= protocols require exactly one value
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:69
+:LINES: 69,81
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -2558,13 +2560,13 @@ Statically check classes implementing zero-, one-, two-, and variadic-argument c
 
 =src/apswtypes.py:92-93= permits =WindowFinal= to receive SQL values. At runtime, =src/connection.c:3627-3629= calls tuple-form final callbacks only with their state object; class-form =final= receives no explicit values. The generated async alias inherits the incorrect signature.
 
-A final callback requiring state plus an SQL value satisfies the annotation but raises =TypeError= during runtime finalization.
+A state-only callback can be rejected by this overly variadic contract, while a variadic implementation that assumes at least one SQL value can type-check but fail when runtime supplies none.
 
 - Direction:
 Define =WindowFinal = Callable[[WindowT], SQLiteResult]=, or =SQLiteValue= if result-alias broadening is not applied concurrently; clarify that tuple form receives only state.
 
 - Test:
-Statically reject a tuple final callback requiring an extra SQL value and accept one receiving only state. At runtime, register multi-argument windows and verify final receives no SQL values.
+Statically require a tuple final callback to accept only the state object and reject one that requires any SQL value. At runtime, register multi-argument windows and verify final receives no SQL values.
 
 
 *** PY144 [MEDIUM] SQL callback result aliases omit supported result values
@@ -2584,19 +2586,19 @@ Valid scalar, aggregate, window, and FTS callbacks produce false-positive type e
 Introduce =SQLiteResult = SQLiteValue | zeroblob | PyObjectBinding= and use it for SQL-function result declarations. Define =ConvertBinding= to return =Binding=. Do not include =CArrayBinding= in =SQLiteResult=.
 
 - Test:
-Statically accept scalar =zeroblob= results and scalar, aggregate, window, and FTS =pyobject= results; accept each enabled binding alternative from =ConvertBinding=; and continue rejecting =CArrayBinding= as an SQL-function result.
+Statically accept =zeroblob= and =pyobject= results for scalar, aggregate, window, and FTS callbacks; accept each enabled binding alternative from =ConvertBinding=; and continue rejecting =CArrayBinding= as an SQL-function result.
 
 
 *** PY145 [MEDIUM] =AsyncConnectionController.send= excludes regular methods returning awaitables
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:203-209; src/async.c:251-259
+:LINES: src/apswtypes.py:203-209; src/async.c:251-259; apsw/tests/async_meta.py:420-449
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=src/apswtypes.py:203-209= declares =send= as =async def=. Runtime dispatch in =src/async.c:251-259= calls =send= and awaits its returned object without requiring that it originated from an =async def=. The test controller in =apsw/tests/async_meta.py= uses a regular =def send= that returns a custom awaitable.
+=src/apswtypes.py:203-209= declares =send= as =async def=. Runtime dispatch in =src/async.c:251-259= merely calls =send= and returns its result to the async call path; it does not require that result to originate from an =async def=. The test controller at =apsw/tests/async_meta.py:444-449= uses a regular =def send= that returns a custom awaitable.
 
 Controllers matching the runtime and documented protocol can fail structural type checking.
 
@@ -2610,13 +2612,13 @@ Statically accept both an =async def send= implementation and a regular method r
 *** PY146 [LOW] =JSONBTypes= models tuples as exactly one element
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:176; src/jsonb.c:815-824
+:LINES: src/apswtypes.py:169-178; src/jsonb.c:815-840
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=src/apswtypes.py:176= uses =tuple["JSONBTypes"]=, which denotes a one-element tuple. =src/jsonb.c:815-824= accepts tuples of arbitrary length as JSON arrays.
+=src/apswtypes.py:176= uses =tuple["JSONBTypes"]=, which denotes a one-element tuple. =src/jsonb.c:815-840= accepts tuples of arbitrary length as JSON arrays.
 
 Empty and multi-element tuples accepted by runtime JSONB encoding are rejected statically.
 
@@ -2624,19 +2626,19 @@ Empty and multi-element tuples accepted by runtime JSONB encoding are rejected s
 Change the tuple branch to =tuple["JSONBTypes", ...]=.
 
 - Test:
-Statically accept empty, single-element, and multi-element nested tuples. Encode and decode each shape at runtime.
+Statically accept empty, single-element, and multi-element nested tuples. Encode each shape and assert decoding preserves its cardinality and content under the selected array hook.
 
 
 *** PY147 [LOW] =TokenizerResult= includes malformed empty tuple forms
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:137-141; src/fts.c:526-548
+:LINES: src/apswtypes.py:137-141; src/fts.c:534-550,573-580
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=src/apswtypes.py:137-141= permits =tuple[str, ...]=, including =()=, and offset tuples with only two integers. =src/fts.c:526-548= rejects empty tuples and requires offset tuples to contain start, end, and at least one token string. The precise non-empty tuple syntax must remain compatible with the project’s Python 3.10 target and supported checker matrix.
+=src/apswtypes.py:137-141= permits =tuple[str, ...]=, including =()=, and offset tuples with only two integers. =src/fts.c:534-550,573-580= rejects empty tuples and requires offset tuples to contain start, end, and at least one token string. The precise non-empty tuple syntax must remain compatible with the project’s Python 3.10 target and supported checker matrix.
 
 Malformed tokenizer output can pass static checking but raises =ValueError= during FTS tokenization.
 
@@ -2650,21 +2652,21 @@ Cover valid =("token",)=, colocated-token, and offset-token forms. Where express
 *** PY148 [LOW] =WindowFactory= excludes runtime-supported list results
 :PROPERTIES:
 :FILE: src/apswtypes.py
-:LINES: src/apswtypes.py:101-103; src/connection.c:3473-3499
+:LINES: src/apswtypes.py:101-103; src/connection.c:3473-3499,3746-3750; apsw/tests/__main__.py:2810-2830,2832-2845
 :CATEGORY: correctness
 :CONFIDENCE: High
 :STATUS: open
 :END:
 
-=src/apswtypes.py:101-103= permits only the tuple factory form. =src/connection.c:3473-3499= explicitly accepts either a tuple or list, and existing tests exercise a list-returning factory.
+=src/apswtypes.py:101-103= permits only the tuple factory form. =src/connection.c:3473-3499= explicitly accepts either a tuple or list, and =src/connection.c:3746-3750= documents a sequence. Existing tests exercise list-returning factories on negative paths for bad lengths and callback elements.
 
 A list-returning factory accepted by runtime and documentation is rejected by static checking.
 
 - Direction:
-Add a list alternative while documenting the necessary broader element type: typing cannot precisely represent the heterogeneous fixed-length list. Do not broaden to arbitrary =Sequence= because runtime accepts tuple and list specifically.
+Add a list alternative while documenting the necessary broader element type: typing cannot precisely represent the heterogeneous fixed-length list. Change the C documentation's broader “sequence” wording to “tuple or list”; do not broaden typing to arbitrary =Sequence= because runtime accepts tuple and list specifically.
 
 - Test:
-Statically accept tuple- and list-returning factories. Execute both successfully, and retain runtime-negative coverage for incorrect list length and non-callable callback positions.
+Statically accept tuple- and list-returning factories. Execute both successfully, retain runtime-negative coverage at =apsw/tests/__main__.py:2810-2830,2832-2845= for bad lists, and assert a custom =Sequence= remains rejected.
 
 ** tools/aio_bench.py
 
@@ -2683,7 +2685,7 @@ Impact: The benchmark compares different SQLite transaction costs rather than is
 
 - Direction: Explicitly configure the same transaction policy on both paths. For example, issue `BEGIN` on both connections immediately before the timed loop, or explicitly configure aiosqlite for autocommit if per-statement transactions are intentional.
 
-- Test: Run a reduced workload and verify that APSW autocommit state and aiosqlite's underlying `in_transaction` state agree before and after the first insert batch; use SQL tracing to confirm equivalent `BEGIN`/`COMMIT` profiles and verify equal final row counts.
+- Test: Run a reduced workload and verify that =not await apsw_connection.get_autocommit()= equals aiosqlite's underlying =in_transaction= before and after the first insert batch; use SQL tracing to confirm equivalent =BEGIN=/=COMMIT= profiles and verify equal final row counts.
 
 
 *** PY150 [MEDIUM] CPU component columns combine incompatible clocks
@@ -2699,9 +2701,9 @@ Evidence: `get_times()` combines `time.process_time()` with `resource.getrusage(
 
 Impact: `CpuEvtLoop` omits event-loop system CPU, while `CpuDbWorker` includes that omitted system CPU and any CPU consumed by unrelated threads. The total remains valid process CPU, but the advertised split is inaccurate and unnecessarily non-portable.
 
-- Direction: Replace the `resource` measurement with `time.thread_time()`, which is compatible with `process_time()`'s user-plus-system accounting and removes the Windows-only dependency. Rename the residual column to `CpuOtherThreads` unless the benchmark directly instruments and guarantees a single database worker thread.
+- Direction: Replace the `resource` measurement with `time.thread_time()`, which is compatible with =process_time()='s user-plus-system accounting and removes the Windows-incompatible dependency. Rename the residual column to `CpuOtherThreads` unless the benchmark directly instruments and guarantees a single database worker thread.
 
-- Test: Inject deterministic process and thread clock values and assert the subtraction. In a smoke benchmark, verify `CpuTotal` approximately equals `CpuEvtLoop + CpuOtherThreads`; add unrelated CPU work in another thread and ensure it is not represented as database-worker-only.
+- Test: Inject deterministic process and thread clock values and assert the subtraction. Add an import smoke test with =resource= unavailable, preferably on native Windows. In a smoke benchmark, verify `CpuTotal` approximately equals `CpuEvtLoop + CpuOtherThreads`; add unrelated CPU work in another thread and ensure it is not represented as database-worker-only.
 
 
 *** PY151 [MEDIUM] Direct uvloop modes fail on Python 3.10 and 3.11
@@ -2719,14 +2721,14 @@ Impact: On Python 3.10 or 3.11 with uvloop installed, the first direct uvloop mo
 
 - Direction: Use a uvloop runner compatible with the supported Python range, implement a correctly cleaned-up explicit event-loop helper for older Python versions, or version-gate direct uvloop modes with a clear skip message.
 
-- Test: With uvloop installed, run a reduced benchmark on Python 3.10, 3.11, and 3.12+. Assert that both direct uvloop modes emit rows without `TypeError` or unawaited-coroutine warnings, and that the AnyIO uvloop mode remains functional.
+- Test: With uvloop installed, run a reduced benchmark on Python 3.10, 3.11, and 3.12+. Require rows when a compatibility runner is implemented, or a clear skip for version-gated direct modes; neither path may produce =TypeError= or unawaited-coroutine warnings, and the AnyIO uvloop mode must remain functional.
 
 ** tools/checksums.py
 
 *** PY152 [LOW] Reported checksum mismatches exit successfully
 :PROPERTIES:
 :FILE: tools/checksums.py
-:LINES: 48-77
+:LINES: 49-78
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -2738,13 +2740,13 @@ Impact: Maintainers and ad hoc automation using this standalone helper can treat
 
 - Direction: Refactor execution into `main()`, aggregate mismatch results, and exit nonzero after reporting all mismatches. Keep missing checksum entries distinct from failures, preferably behind an explicit generation mode; send failure diagnostics to stderr.
 
-- Test: Mock downloading and verify: matching data exits zero; altered data for an existing entry exits nonzero and identifies the URL; multiple mismatches are all reported or fail fast as documented; missing entries follow the explicit generation policy; malformed checksum data and network failures remain nonzero.
+- Test: Mock downloading and verify: matching data exits zero; altered data for an existing entry exits nonzero and identifies the URL; all mismatches are reported before the final nonzero exit; missing entries follow the explicit generation policy; malformed checksum data and network failures remain nonzero.
 
 
 *** PY153 [LOW] Downloads have no tool-controlled time or resource bounds
 :PROPERTIES:
 :FILE: tools/checksums.py
-:LINES: 64-65,72-73
+:LINES: 49-50,66,70,74,78
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: High (mechanics); Medium (practical impact)
 :STATUS: open
@@ -2754,9 +2756,9 @@ Evidence: Both download loops call `urllib.request.urlopen(url).read()` without 
 
 Impact: A stalled or continuously trickling endpoint can block a checksum refresh for an uncontrolled duration, and an unexpectedly large response can consume excessive memory. The URLs are fixed release archives and the tool is a standalone maintainer helper, so the practical impact is limited; this is not evidence that invalid content can pass verification.
 
-- Direction: Add a configurable finite network timeout, use response context managers, and hash incrementally in bounded chunks while counting bytes. If a maximum size is enforced, make it configurable and do not rely solely on `Content-Length`.
+- Direction: Add configurable finite per-operation network timeouts plus an overall elapsed-time deadline, use response context managers, and hash incrementally in bounded chunks while counting bytes. If a maximum size is enforced, make it configurable and do not rely solely on =Content-Length=.
 
-- Test: With an injected opener or controlled local server, verify timeout configuration is passed and enforced; verify chunked hashing produces the same byte count and digests as one-shot data; verify an over-limit response fails cleanly without retaining the whole body; and verify response closure and useful URL diagnostics on success and failure.
+- Test: With an injected opener or controlled local server, verify stalled and continuously trickling responses both exceed their respective bounds; verify chunked hashing produces the same byte count and digests as one-shot data; if a maximum is part of the chosen policy, verify an over-limit response fails without retaining the whole body; and verify response closure and useful URL diagnostics.
 
 ** tools/checkversion.py
 
@@ -2769,7 +2771,7 @@ Impact: A stalled or continuously trickling endpoint can block a checksum refres
 :STATUS: open
 :END:
 
-Evidence: `vers["megatest SQLITEVERS"] = convert_to_number(min(megatest.SQLITEVERS))` applies `min()` to version strings. For example, lexical ordering selects `"3.53.10"` before `"3.53.9"`, although `3.53.9` is the lower SQLite version. Current matrix values `3.53.0` through `3.53.3` do not trigger the defect.
+Evidence: `vers["megatest SQLITEVERS"] = convert_to_number(min(megatest.SQLITEVERS))` applies `min()` to version strings. For example, lexical ordering selects `"3.53.10"` before `"3.53.9"`, although `3.53.9` is the lower SQLite version. Current matrix values =3.53.0= through =3.53.4= do not trigger the defect.
 
 Impact: A future release consistency check can choose the wrong matrix minimum, either failing a consistent declaration or passing a declaration that excludes an actually tested older version.
 
@@ -2800,7 +2802,7 @@ Impact: A malformed textual declaration can normalize to the same value as a dif
 *** PY156 [LOW] Fault-injection exclusion misses current conditional form
 :PROPERTIES:
 :FILE: tools/coverageanalyser.py
-:LINES: 44-63; src/unicode.c:29-31,2665-2685
+:LINES: tools/coverageanalyser.py:44-63; src/unicode.c:29-31,2666-2686
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: High
 :STATUS: open
@@ -2830,7 +2832,7 @@ Impact: In a strict non-UTF-8 Python locale, valid current coverage artifacts ca
 
 - Direction: Open `.gcov` files explicitly as UTF-8 using `open(f, "rt", encoding="utf-8")`. Preserve strict decoding so malformed artifacts are not silently concealed.
 
-- Test: Create a `.gcov` fixture containing the UTF-8 snowman and run the analyzer in a subprocess with UTF-8 mode and locale coercion disabled under a strict non-UTF-8 default encoding. Assert successful parsing and correct totals; separately assert that invalid UTF-8 fails if strict handling is intended.
+- Test: Create a `.gcov` fixture containing the UTF-8 snowman and run the analyzer in a subprocess with Python UTF-8 mode and locale coercion disabled under a strict non-UTF-8 default encoding. Assert successful parsing and correct totals; separately assert that invalid UTF-8 fails.
 
 
 *** PY158 [LOW] Gcov exceptional zero-count marker is counted as executed
@@ -2846,36 +2848,34 @@ Evidence: The analyzer ignores only `-` and considers every count other than `##
 
 Impact: Whenever a supported coverage artifact contains `=====`, each such line is falsely reported as covered and inflates the percentage. No committed artifact establishes that the current C-only workflow emits this marker, so present numerical inflation is unproven.
 
-- Direction: Treat `=====` like `#####`: include it in the total but not the executed set. Prefer positive parsing of numeric count tokens, including deliberately supported decorated numeric forms such as `1*`, rather than treating every non-`#####` token as executed.
+- Direction: Treat numeric zero, `=====`, and `#####` as total-only; treat positive numeric counts as executed. Prefer positive parsing of supported count tokens, including deliberately supported decorated numeric forms such as `1*`, rather than treating every non-`#####` token as executed.
 
-- Test: Run a textual `.gcov` fixture containing `-`, `#####`, `=====`, zero/positive numeric counts, and `1*`. Assert exact executed and total line sets, including that `=====` is total-only; cover supported GNU gcov and `llvm-cov gcov` output dialects where their conventions differ.
+- Test: Run a textual `.gcov` fixture containing `-`, `#####`, `=====`, zero/positive numeric counts, and `1*`. Assert exact executed and total line sets, including that zero and both unexecuted markers are total-only; cover supported GNU gcov and `llvm-cov gcov` output dialects where their conventions differ.
 
 ** tools/code2rst.py, tools/genconstants.py, tools/gendocstrings.py
 
 *** PY159 [LOW] Shared TOC URL handling requires a trailing slash and lacks a finite timeout
 :PROPERTIES:
 :FILE: tools/code2rst.py, tools/genconstants.py, tools/gendocstrings.py
-:LINES: tools/code2rst.py:31,44,56,58,62; tools/genconstants.py:66-68; tools/gendocstrings.py:59-62,73-77
+:LINES: tools/code2rst.py:31,43-44,56,58,62; tools/genconstants.py:66-68; tools/gendocstrings.py:59-62,73-77
 :CATEGORY: generation network reliability
 :CONFIDENCE: high on mechanics; medium on practical impact
 :STATUS: open
 :END:
 
 All three TOC consumers concatenate =SQLITE_URL= with ="toc.db"= and use
-=urlopen(...).read()= without an explicit timeout.  Natural no-slash roots form
-malformed URLs, and a stalled server can hang generation.  This is a reliability
+=urlopen(...).read()= without an explicit timeout.  Natural no-slash roots form incorrect URLs, and a stalled server can hang generation.  This is a reliability
 issue, not a hostile-endpoint security finding.
 
 - Direction: use one helper that normalizes directory URL semantics, preserves
   nested paths, and applies a documented finite timeout.
-- Test: with a local HTTP fixture, verify slash/no-slash roots request the same
-  resource and a nonresponding server fails within the configured timeout.
+- Test: with a local HTTP fixture, verify slash/no-slash roots request the same TOC resource and generate identical function and constant links; require a nonresponding server to fail within the configured timeout.
 
 
 *** PY160 [LOW] Open temporary TOC databases may not reopen on native Windows
 :PROPERTIES:
 :FILE: tools/code2rst.py, tools/genconstants.py, tools/gendocstrings.py
-:LINES: tools/code2rst.py:43-47; tools/genconstants.py:67-71; tools/gendocstrings.py:59-64
+:LINES: tools/code2rst.py:43-47; tools/genconstants.py:67-71; tools/gendocstrings.py:60-64
 :CATEGORY: portability
 :CONFIDENCE: medium-high
 :STATUS: runtime validation
@@ -2896,7 +2896,7 @@ portability; native Windows execution was unavailable during the audit.
 *** PY161 [MEDIUM] Shared docdb updates race and broad exception silently resets data
 :PROPERTIES:
 :FILE: tools/code2rst.py
-:LINES: 160-168; Makefile:13-23,100-101
+:LINES: tools/code2rst.py:160-168; Makefile:13-23,100-104
 :CATEGORY: generation data integrity
 :CONFIDENCE: high
 :STATUS: open
@@ -2911,14 +2911,13 @@ therefore omit APIs.
 - Direction: write per-source fragments and merge once, or lock the entire
   read/merge/atomic-replace transaction.  Treat only a missing initial file as
   empty and preserve malformed bytes on failure.
-- Test: synchronize two generators after reading the same original and require
-  the final union; seed malformed JSON and require unchanged bytes plus failure.
+- Test: coordinate concurrent starts before lock acquisition and require serialized completion plus the final union; test fragment merging separately if that design is selected. Seed malformed JSON and require unchanged bytes plus failure.
 
 
 *** PY162 [LOW] Output publication is non-atomic and path-collision unsafe
 :PROPERTIES:
 :FILE: tools/code2rst.py
-:LINES: 28-29,326,401
+:LINES: 28-29,160-168,326,401
 :CATEGORY: generation publication
 :CONFIDENCE: high
 :STATUS: open
@@ -2932,21 +2931,21 @@ docdb when that path collides, or leave a partial destination on write failure.
 - Direction: resolve and reject all input/output/docdb collisions before
   mutation, then publish complete RST through a sibling temporary and
   =os.replace()=.
-- Test: exercise both collision cases and an injected final-write failure,
-  requiring controlled failure and unchanged original destinations.
+- Test: exercise all three pairwise input/output/docdb collision cases and an injected final-write failure, requiring controlled failure and unchanged original destinations.
 
 
 *** PY163 [LOW] Consecutive SQLite-call markers retain only the final RST marker
 :PROPERTIES:
 :FILE: tools/code2rst.py
-:LINES: 176-180,205-212; src/session.c:2383-2384,2439-2440,2498-2499
+:LINES: tools/code2rst.py:176-180,205-212; src/session.c:2383-2384,2439-2440,2498-2499
 :CATEGORY: documentation generation
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
 Each =-* ...= line overwrites the prior =indexop, saop=.  Current
-=ChangesetBuilder.add_insert=, =add_delete=, and =add_update= consequently omit
+=ChangesetBuilder.add_insert=, =add_delete=, and =add_update= consequently retain
+only =sqlite3changegroup_change_finish= while omitting
 =sqlite3changegroup_change_begin= from generated RST.  The raw markers enter
 the docdb before this conversion, so runtime docstrings/stubs are not affected
 by this particular defect.
@@ -2980,7 +2979,7 @@ interface, not proof of wrong-version output.
 *** PY165 [LOW] Malformed parser state enters interactive pdb
 :PROPERTIES:
 :FILE: tools/code2rst.py
-:LINES: 364-369
+:LINES: 365-368
 :CATEGORY: generator diagnostics
 :CONFIDENCE: high
 :STATUS: open
@@ -3000,14 +2999,14 @@ failure instead of the source structure error.
 *** PY166 [LOW] Reverse mappings select incidental sentinel aliases
 :PROPERTIES:
 :FILE: tools/genconstants.py
-:LINES: 80,156-160; src/constants.c:226-264,856-884
+:LINES: tools/genconstants.py:80,156-160; src/constants.c:226-264,856-884
 :CATEGORY: generated API mapping
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
 Bidirectional entries overwrite duplicate integer keys in lexical name order.
-For SQLite 3.53.3, =SQLITE_DBCONFIG_FP_DIGITS= and sentinel
+For SQLite 3.53.4, =SQLITE_DBCONFIG_FP_DIGITS= and sentinel
 =SQLITE_DBCONFIG_MAX= both equal 1023, so reverse lookup prefers the sentinel.
 Forward mappings remain correct; reverse alias selection is accidental.
 
@@ -3021,15 +3020,15 @@ Forward mappings remain correct; reverse alias selection is accidental.
 *** PY167 [MEDIUM] Live TOC metadata is not tied to the pinned SQLite version
 :PROPERTIES:
 :FILE: tools/genconstants.py
-:LINES: 66-68,71-72; Makefile:2,106-108,120-121
+:LINES: tools/genconstants.py:66-68,71-72; Makefile:2,106-108,120-121
 :CATEGORY: reproducible generation
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
-The project pins SQLite 3.53.3, but the generator downloads mutable unversioned
+The project pins SQLite 3.53.4, but the generator downloads mutable unversioned
 =toc.db= without checking it against the pinned headers.  Current generated C
-agrees with 3.53.3, but future live metadata can change output at the same commit
+agrees with 3.53.4, but future live metadata can change output at the same commit
 or reference newer macros.  Make also removes/truncates =src/constants.c=
 before successful generation.
 
@@ -3044,7 +3043,7 @@ before successful generation.
 *** PY168 [MEDIUM] Multi-call expansion deletes following documentation
 :PROPERTIES:
 :FILE: tools/gendocstrings.py
-:LINES: 202-208; src/cursor.c:1244-1249
+:LINES: tools/gendocstrings.py:202-208; src/cursor.c:1244-1249; apsw/__init__.pyi:2798-2807; src/apsw.docstrings:3491-3500
 :CATEGORY: documentation generation
 :CONFIDENCE: high
 :STATUS: open
@@ -3063,7 +3062,7 @@ links in generated =apsw/__init__.pyi= and runtime docstrings.
 *** PY169 [LOW] Generated constant docstrings contain malformed RST links
 :PROPERTIES:
 :FILE: tools/gendocstrings.py
-:LINES: 924-926; apsw/__init__.pyi:4478
+:LINES: tools/gendocstrings.py:924-926; apsw/__init__.pyi:4533-5377
 :CATEGORY: stub documentation
 :CONFIDENCE: high
 :STATUS: open
@@ -3081,7 +3080,7 @@ stub-aware documentation/IDE rendering without affecting constant values.
 *** PY170 [MEDIUM] Validation failures can leave source and artifacts partly updated
 :PROPERTIES:
 :FILE: tools/gendocstrings.py
-:LINES: 330-355,685,1063,1067-1077
+:LINES: 320-355,683-685,959-961,1021-1027,1066-1081
 :CATEGORY: generation publication
 :CONFIDENCE: high
 :STATUS: open
@@ -3092,11 +3091,8 @@ ongoing; =src/apsw.docstrings= is written before unreferenced-symbol validation;
 and the stub is generated afterward.  A late failure can leave these outputs
 inconsistent, while direct writes can truncate on I/O failure.
 
-- Direction: compute and validate every update first, then stage all destinations
-  through sibling temporaries and publish with =os.replace()=.
-- Test: inject a late validation/signature failure after an earlier rewrite
-  candidate and require all source/output bytes unchanged; also inject a write
-  failure and preserve each destination.
+- Direction: compute and validate every update first, then stage all destinations through sibling temporaries. If only pre-publication failures are covered, document that guarantee; otherwise publish with rollback/recovery across replacement boundaries because sequential =os.replace()= calls are atomic only per file.
+- Test: inject a late validation/signature failure after an earlier rewrite candidate and require all source/output bytes unchanged; inject staging and each replacement-boundary failure, verifying the documented rollback/recovery guarantee.
 
 
 *** PY171 [LOW] Unsupported signatures can invoke an interactive debugger
@@ -3122,7 +3118,7 @@ maintenance edits can make noninteractive generation stop in a debugger.
 *** PY172 [MEDIUM] C block replacement uses ambiguous substring and brace heuristics
 :PROPERTIES:
 :FILE: tools/gendocstrings.py
-:LINES: 330-349
+:LINES: 320-349
 :CATEGORY: source rewriting safety
 :CONFIDENCE: high
 :STATUS: runtime validation
@@ -3144,7 +3140,7 @@ source file.
 *** PY173 [MEDIUM] Public APSW types are excluded without member audit
 :PROPERTIES:
 :FILE: tools/docmissing.py
-:LINES: 89-100,129-150
+:LINES: 89-100,129-151
 :CATEGORY: documentation checker coverage
 :CONFIDENCE: high
 :STATUS: runtime validation
@@ -3183,22 +3179,22 @@ The checker still fails closed, but hides later discrepancies behind a traceback
 
 *** PY175 [LOW] Virtual-table protocols are validated only by member count
 :PROPERTIES:
-:FILE: tools/docmissing.py
-:LINES: 83-87
+:FILE: tools/docmissing.py, src/vtable.c, tools/code2rst.py
+:LINES: tools/docmissing.py:83-87; src/vtable.c:2179-2214,2821-2824; tools/code2rst.py:224-232
 :CATEGORY: documentation checker coverage
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
 =VTModule=, =VTTable=, and =VTCursor= are checked only against counts 3, 17,
-and 7.  Same-count substitution or duplicate-plus-omission passes.  These are
-intentionally not runtime classes, so this is false confidence rather than a
-current runtime mismatch.
+and 7.  Same-count substitution or duplicate-plus-omission passes.  This also
+masks a current mismatch: =VTTable.RollbackTo= is installed in
+=src/vtable.c:2179-2214,2821-2824= but its comment is not a documentation
+comment, while =tools/code2rst.py:224-232= mis-maps ordinary =Rollback= to the
+~xRollbackTo~ reference.
 
-- Direction: compare exact unique names against an independently maintained
-  callback contract, not generated stubs alone.
-- Test: cover same-count substitution, duplicate-plus-omission, missing
-  protocol, and the current valid sets.
+- Direction: restore and generate =RollbackTo= documentation, correct the =Rollback= link mapping, and compare exact unique names against the independently maintained 18-member =VTTable= callback contract and corresponding exact contracts for the other protocols.
+- Test: cover same-count substitution, duplicate-plus-omission, missing protocol, and the exact current valid sets, including distinct =Rollback= and =RollbackTo= entries and links.
 
 
 *** PY176 [LOW] Pragma consistency checks disappear under optimized Python
@@ -3231,7 +3227,8 @@ optimized, and no current mismatch is claimed.
 :END:
 
 Replacement loops suppress lines while marker-state flags remain active.  A
-missing close leaves the flag active to EOF and writes a shortened document;
+missing close suppresses subsequent content, potentially to EOF, although a
+later unrelated end marker can also clear the shared state incorrectly;
 missing, duplicate, and reversed markers are not diagnosed.  Current pairs are
 valid, so this is a future template-regression hazard.
 
@@ -3339,7 +3336,7 @@ produce non-UTF-8 documentation.
 *** PY183 [LOW] gen_rst flushes an accidental global instead of its output stream
 :PROPERTIES:
 :FILE: tools/example2rst.py
-:LINES: 221-255,264
+:LINES: 221-255,264-265
 :CATEGORY: helper contract
 :CONFIDENCE: high
 :STATUS: open
@@ -3357,7 +3354,7 @@ flushes the wrong stream.
 *** PY184 [HIGH] Python 3.12+ suppresses every named APSW_FAULT injection
 :PROPERTIES:
 :FILE: tools/fi.py
-:LINES: 942-948; src/faultinject.c:126-147; src/pyutil.c:176-213
+:LINES: 942-948; src/faultinject.c:126-147; src/pyutil.c:17-21,176-213
 :CATEGORY: fault-injection coverage
 :CONFIDENCE: high
 :STATUS: open
@@ -3435,7 +3432,7 @@ and obscures the original exception.
 *** PY188 [MEDIUM] Leak detection can block or continue instead of failing
 :PROPERTIES:
 :FILE: tools/fi.py
-:LINES: 1022-1030,1163-1172
+:LINES: 1022-1030,1141-1172
 :CATEGORY: CI determinism
 :CONFIDENCE: high
 :STATUS: open
@@ -3498,9 +3495,9 @@ For an unmatched example, an f-string references undefined =pattern= before
 
 Entries are emitted for every =src/*.c=, but commands compile only =src/apsw.c=
 or =src/unicode.c=.  Most mismatches are included implementation fragments;
-=testextension.c= and =fileio_win32.c= are separately built helpers.  In every
-case the JSON =file= field can disagree with the command's translation unit,
-misleading indexers and diagnostics.
+=testextension.c= and =fileio_win32.c= are separately built helpers.  Most entries therefore have a JSON =file= field that disagrees with the
+command's translation unit, misleading indexers and diagnostics; the entries
+for =src/apsw.c= and =src/unicode.c= themselves agree.
 
 - Direction: emit only real extension translation units, plus accurate helper
   commands if whole-project scope is intended.
@@ -3528,15 +3525,13 @@ misleading indexers and diagnostics.
 *** PY193 [MEDIUM] Standard Windows Python configurations are unsupported
 :PROPERTIES:
 :FILE: tools/gencompilecommands.py
-:LINES: 18-24
+:LINES: 18-20
 :CATEGORY: platform portability
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
-The generator assumes Unix =CC=, =CFLAGS=, and =CCSHARED= variables and emits
-GCC switches.  Standard Windows CPython/MSVC lacks equivalent variables and
-syntax; Python 3.12+ can raise at =shlex.split(None)=.
+The generator assumes Unix =CC=, =CFLAGS=, and =CCSHARED= variables. Standard Windows CPython/MSVC configurations can leave them absent; on Python 3.12+ =shlex.split(None)= raises =ValueError=, while older behavior can read standard input and still leaves no compiler executable.
 
 - Direction: derive commands from the actual platform compiler, including MSVC
   syntax, or fail with an explicit unsupported-platform diagnostic.
@@ -3546,8 +3541,8 @@ syntax; Python 3.12+ can raise at =shlex.split(None)=.
 
 *** PY194 [MEDIUM] Fault inventory omits actively used faultable Python APIs
 :PROPERTIES:
-:FILE: tools/genfaultinject.py
-:LINES: 88-210
+:FILE: tools/genfaultinject.py, tools/fi.py, src/argparse.c, src/async.c, src/jsonb.c, src/unicode.c, src/util.c
+:LINES: tools/genfaultinject.py:88-210,232-258; tools/fi.py:918-929; src/argparse.c:319-370; src/async.c:203-208; src/jsonb.c:883-887; src/unicode.c:1345,1852-1863; src/util.c:168-171
 :CATEGORY: fault-injection coverage
 :CONFIDENCE: high
 :STATUS: open
@@ -3623,21 +3618,15 @@ newer than prerequisites.
 *** PY198 [HIGH] Broad session patterns suppress required mutex wrappers
 :PROPERTIES:
 :FILE: tools/gensqlitedebug.py
-:LINES: 155-156,197,266,294-300
+:LINES: tools/gensqlitedebug.py:155,197,263-267,288-319; src/session.c:1918-1959,2093-2150,2167-2231,2273-2601
 :CATEGORY: SQLite debug mutex coverage
 :CONFIDENCE: high
 :STATUS: runtime validation
 :END:
 
-A broad =sqlite3change(group|set)_.*= rule shadows explicit rules, and the v3
-apply rule is misspelled.  Generated debug C lacks wrappers for four v2/v3
-changeset-apply forms and =sqlite3changegroup_schema=.  Apply call sites hold
-the mutex but lack enforcement; =ChangesetBuilder_schema()= itself calls the
-schema API without acquiring =dbmutex= and later lifecycle code assumes it,
-making this also a current mutex-lifecycle concern.
+A broad =sqlite3change(group|set)_.*= rule suppresses wrapper generation for all four apply APIs and shadows the specific =sqlite3changegroup_schema= rule; the sole intended specific v3 apply rule is also misspelled. Generated debug C therefore lacks all five wrappers. The apply call sites hold =dbmutex= but lack generated enforcement. =ChangesetBuilder_schema()= and later schema-backed builder operations do not acquire or route through the mutex/async worker; close and deallocation acquire the mutex independently.
 
-- Direction: narrow/reorder rules, fix spelling, generate the correct argument
-  checks, validate overlap, and repair schema acquisition/release.
+- Direction: narrow/reorder rules, fix spelling, generate the correct argument checks, and validate classification overlap. Separately serialize or reject schema-backed builder work through the connection's mutex/async-affinity policy with coherent cleanup.
 - Test: unit-test all five classifications and run debug threaded builder
   schema/add/close coverage that detects missing acquisition.
 
@@ -3681,7 +3670,7 @@ Repository/pathspec failures can therefore masquerade as absent API usage.
 *** PY201 [LOW] Failed generation can leave a partial target considered current
 :PROPERTIES:
 :FILE: tools/genstrings.py
-:LINES: 89-122; Makefile:110-112
+:LINES: tools/genstrings.py:92-125; Makefile:110-112
 :CATEGORY: generated-artifact publication
 :CONFIDENCE: high
 :STATUS: open
@@ -3788,16 +3777,13 @@ preserve surrounding separators, handle padded and terminal lines, and make
 lossy cleanup optional where practical.
 
 - Test:
-Verify a legitimate 76-character line remains unchanged, surrounding prose
-stays on separate lines, and a representative multiline quoted-base64 block,
-including its padded or short final line, is removed without consuming adjacent
-ordinary text.
+Use LF and CRLF fixtures containing a legitimate 76-character line, adjacent candidate lines, and an inline whitespace-delimited candidate. Verify surrounding prose and separators remain unchanged and a representative multiline quoted-base64 block, including its padded or short final line, is handled only by the documented optional policy.
 
 
 *** PY205 [MEDIUM] Raw SQL table-name interpolation affects both importers
 :PROPERTIES:
 :FILE: tools/import_enron.py
-:LINES: 66-68
+:LINES: tools/import_enron.py:66-68; tools/import_html.py:23-26
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: high
 :STATUS: open
@@ -3832,7 +3818,7 @@ succeeds for valid literal names, and the sentinel survives.
 *** PY206 [LOW] Progress output has a duplicate terminal percentage and unsupported fixed denominator
 :PROPERTIES:
 :FILE: tools/import_enron.py
-:LINES: 18-23, 53-61, 82-88
+:LINES: 19-23,53-61,103
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: high
 :STATUS: open
@@ -3858,7 +3844,7 @@ skipped member and a custom-sized archive, asserting counters distinguish
 processed, imported, and skipped records and do not depend on ~517402~.
 
 
-*** PY207 [LOW] Post-commit VACUUM is unconditional and can obscure a successful import
+*** PY207 [LOW] Automatic VACUUM can obscure completed import work
 :PROPERTIES:
 :FILE: tools/import_enron.py
 :LINES: 65-69
@@ -3867,23 +3853,16 @@ processed, imported, and skipped records and do not depend on ~517402~.
 :STATUS: open
 :END:
 
-The import transaction completes at the end of the connection context, then
-~con.execute("vacuum")~ rebuilds the entire selected database.  If this
-maintenance operation fails, the imported table has already committed.
+At top-level CLI use, the import transaction completes at the end of the connection context, then ~con.execute("vacuum")~ rebuilds the entire selected database. If =do_import()= runs inside an existing outer transaction, however, the context releases only its nested savepoint and =VACUUM= fails while the import remains uncommitted. Thus a maintenance failure can follow completed insertion work under either transaction state.
 
 The command can add substantial full-database I/O and temporary-space needs,
-especially when the database contains unrelated large tables.  A maintenance
-failure can appear to the operator as though the completed import failed.
+especially when the database contains unrelated large tables.  A maintenance failure can appear to the operator as though insertion failed; at top level the import is already committed, while under an existing outer transaction it remains uncommitted.
 
 - Direction:
-Make vacuuming explicit with a documented option or policy.  Report successful
-import completion before maintenance starts, and state clearly when an optional
-vacuum fails after the import committed.
+Make vacuuming explicit with a documented option or policy. Report insertion completion and transaction state before maintenance starts, and state clearly whether an optional vacuum failed after a committed top-level import or within an uncommitted outer transaction.
 
 - Test:
-Trace the selected vacuum behavior, inject a vacuum failure after successful
-insertion, and assert imported rows remain committed while the diagnostic
-distinguishes import success from maintenance failure.
+Trace the selected vacuum behavior in top-level and existing-outer-transaction cases. Inject a vacuum failure after successful insertion and assert diagnostics accurately distinguish committed import success from uncommitted nested work and maintenance failure.
 
 ** tools/import_html.py
 
@@ -3918,7 +3897,7 @@ For invalid bytes or an unsupported declaration, assert the error names the ZIP
 member and the previous destination table remains unchanged.
 
 
-*** PY209 [LOW] ZIP directory entries whose names end in .html or .htm become empty documents
+*** PY209 [LOW] HTML-suffixed ZIP directory entries are imported as documents
 :PROPERTIES:
 :FILE: tools/import_html.py
 :LINES: 17-19
@@ -3927,19 +3906,15 @@ member and the previous destination table remains unchanged.
 :STATUS: open
 :END:
 
-Suffix filtering occurs without checking ~member.is_dir()~.  A directory entry
-named ~section.html/~ has the ~.html~ suffix, and ~ZipFile.read()~ returns empty
-bytes for it, so the importer inserts it as an empty HTML row.
+Suffix filtering occurs without checking ~member.is_dir()~.  A directory entry named ~section.html/~ has the ~.html~ suffix and is inserted as a document. Conventional directory entries produce empty bytes, while a directory entry carrying bytes can produce nonempty bogus content.
 
-Archives with HTML-suffixed directories gain bogus empty documents, skewing
-document counts and downstream indexing.
+Archives with HTML-suffixed directories gain bogus documents, skewing document counts and downstream indexing.
 
 - Direction:
 Exclude directory entries before applying the suffix filter.
 
 - Test:
-Create a ZIP containing ~section.html/~, ~section.html/page.htm~, and
-~page.html~.  Assert only the two regular files are imported.
+Create a ZIP containing empty and nonempty ~section.html/~ directory entries, ~section.html/page.htm~, and ~page.html~. Assert only the two regular files are imported.
 
 ** tools/json_bench.py
 
@@ -3964,16 +3939,10 @@ ordinary strings.  Nested-object traversal, JSON/JSONB sizes, and relative
 timings do not represent the intended nested Python-object workload.
 
 - Direction:
-Retain the decoded objects, recursively validate contained strings for UTF-8
-encodability, and extend ~data~ with those parsed objects.  Continue using
-original JSON text lengths only if the size option is explicitly defined as
-input-text bytes.
+Retain the decoded objects, recursively validate contained strings for UTF-8 encodability, and extend ~data~ with those parsed objects. Define the size option's unit explicitly: use encoded byte lengths if it means source JSON bytes, or document and count source-text characters.
 
 - Test:
-Use deterministic JSON containing nested values.  Assert retained values are
-structured objects rather than strings, JSON and JSONB round trips preserve
-them, lone-surrogate input is rejected by recursive validation, and the final
-benchmark object contains nested non-string values.
+Use deterministic multibyte JSON containing nested values. Assert retained values are structured objects rather than strings, JSON and JSONB round trips preserve them, lone-surrogate input is rejected by recursive validation, the configured size unit is honored, and the final benchmark object contains nested non-string values.
 
 
 *** PY211 [HIGH] The row labelled stdlib json.loads measures json.dumps
@@ -4006,7 +3975,7 @@ the original object, and it is not a newly escaped JSON string.
 *** PY212 [LOW] Claimed JSONB warm-up does not call either function
 :PROPERTIES:
 :FILE: tools/json_bench.py
-:LINES: 65-70, 96-102
+:LINES: 65-73,94-102
 :CATEGORY: benchmark correctness
 :CONFIDENCE: high
 :STATUS: open
@@ -4159,7 +4128,7 @@ number of probes, the heading reports the correct denominator, and advancing
 :STATUS: open
 :END:
 
-All =pyver == "system"= jobs receive =--use-system-sqlite-config=, so =config=none= and =config=full= do not exercise their requested SQLite configurations. The planner also schedules =gil=False= for system Python based on lexical version comparison, but =buildpython()= immediately returns =/usr/bin/python3= without configuring a free-threaded interpreter. Jobs are not necessarily byte-identical because warning flags and randomized extension flags may differ, but their labels claim coverage that is not being exercised.
+All =pyver == "system"= jobs receive =--use-system-sqlite-config=, so =config=none= and =config=full= do not exercise their requested SQLite configurations. The planner also schedules =gil=False= for system Python because =natural_compare("system", "3.14")= treats the non-version sentinel as newer, but =buildpython()= immediately returns =/usr/bin/python3= without configuring a free-threaded interpreter. Jobs are not necessarily byte-identical because warning flags and randomized extension flags may differ, but their labels claim coverage that is not being exercised.
 
 - Direction: Detect the installed system interpreter's GIL mode, schedule only that effective mode, and either limit system Python to =config=system= or honor the requested =none= and =full= configuration flags.
 
@@ -4185,7 +4154,7 @@ The job first builds APSW in place with =build_ext --inplace=, then builds and i
 *** PY219 [HIGH] Worker failures are reported but do not fail megatest
 :PROPERTIES:
 :FILE: tools/megatest.py
-:LINES: 148-156, 305-315
+:LINES: 148-156,306-316
 :CATEGORY: Test failure propagation
 :CONFIDENCE: High
 :STATUS: open
@@ -4217,7 +4186,7 @@ Startup unconditionally removes matching APSW packages from =$HOME/.local/lib/py
 *** PY221 [MEDIUM] Shell interpolation permits command injection and unsafe path handling
 :PROPERTIES:
 :FILE: tools/megatest.py
-:LINES: 34-35, 57-77, 94-95, 123-129, 189-215, 283-314
+:LINES: 34-35,57-77,94-96,123-129,189-215,284-316
 :CATEGORY: Command execution safety
 :CONFIDENCE: High
 :STATUS: open
@@ -4423,7 +4392,7 @@ Use a fixture returning `ENABLE_FTS5`; require `#define SQLITE_ENABLE_FTS5 1`, t
 :STATUS: open
 :END:
 
-The utility converts every reported diagnostic string into a `#define`. SQLite can report `COMPILER=gcc-...`, producing a `SQLITE_COMPILER` replacement that is not source-valid C macro content. The maintained `setup.py` path removes `SQLITE_COMPILER` and cleans up derived mutex-selection macros.
+The utility converts every reported diagnostic string into a `#define`. SQLite can report `COMPILER=gcc-...`, producing an unquoted `SQLITE_COMPILER` value that is unreliable and generally unusable as a source-level configuration value. The maintained `setup.py` path removes `SQLITE_COMPILER` and cleans up derived mutex-selection macros.
 
 A consumer using the generated output as a configuration header can receive invalid or behavior-altering macro definitions.
 
@@ -4457,22 +4426,20 @@ Invoke the utility with a fixture library basename from the current directory wi
 
 *** PY234 [LOW] Blind identifier substitution can corrupt existing RST markup
 :PROPERTIES:
-:FILE: tools/types2rst.py
-:LINES: 93-124
+:FILE: tools/types2rst.py, src/apswtypes.py
+:LINES: tools/types2rst.py:93-124; src/apswtypes.py:192-200
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
-`nomunge()` applies identifier substitution over whole values and descriptions, including existing roles and inline literals. A matched name in `:class:\`Foo\``, `:meth:\`Foo.bar\``, or ``Foo`` becomes nested or altered markup. Current source occurrences are covered by a `Mapping` placeholder workaround and a targeted `FTS5ExtensionApi.query_phrase` repair.
-
-Future descriptions using known generated names inside existing RST constructs can produce malformed documentation.
+`nomunge()` applies identifier substitution over whole values and descriptions, including existing roles and inline literals. A matched name in `:class:\`Foo\``, `:meth:\`Foo.bar\``, or ``Foo`` becomes nested or altered markup. Current source already contains =:attr:`Connection.connection_hooks`= in =src/apswtypes.py:199=, so substitution nests generated class markup inside an existing role. Other future descriptions using known generated names inside RST constructs can likewise produce malformed documentation.
 
 - Direction:
 Protect or tokenize existing RST inline constructs before linking identifiers, rather than applying global substitution and special-case repairs.
 
 - Test:
-Render content containing plain `Foo`, `:class:\`Foo\``, `:meth:\`Foo.bar\``, and ``Foo``. Require only plain text to be linked, then validate the result with docutils or Sphinx.
+Render the current =Connection.connection_hooks= reference plus content containing plain `Foo`, `:class:\`Foo\``, `:meth:\`Foo.bar\``, and ``Foo``. Require existing constructs to remain byte-for-byte valid and only plain text to be linked, then validate with docutils or Sphinx.
 
 
 *** PY235 [LOW] Global asterisk replacement can change literal values
@@ -4498,7 +4465,7 @@ Cover both `Callable[[*Ts], R]` and `Literal["*"]`; require required unpacking s
 *** PY236 [LOW] Output encoding depends on the process locale
 :PROPERTIES:
 :FILE: tools/types2rst.py
-:LINES: 75,157,160
+:LINES: 75,157,160-162
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: high
 :STATUS: open
@@ -4538,13 +4505,13 @@ Seed the destination with sentinel content, force processing or rendering to fai
 *** PY238 [LOW] Python data objects use class roles
 :PROPERTIES:
 :FILE: tools/types2rst.py
-:LINES: 80-87
+:LINES: 47-54,65,80-87
 :CATEGORY: maintenance-tool correctness
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
-The renderer emits `:class:` for all configured standard names, including `None`, `typing.Any`, and `typing.Tuple`. Python intersphinx inventories classify these as `py:data`, while `:class:` resolves only class and exception targets. Current generated content includes `:class:\`None\`` and `:class:\`~typing.Any\``.
+The renderer emits `:class:` for all configured standard names, including `None`, `typing.Any`, and `typing.Tuple`. Python intersphinx inventories classify these as `py:data`, while `:class:` resolves only class and exception targets. `Tuple` is configured but is not currently used by `src/apswtypes.py`; current generated content includes `:class:\`None\`` and `:class:\`~typing.Any\``.
 
 Generated documentation can contain unresolved links and nitpicky Sphinx warnings. The normal documentation build does not treat warnings as errors.
 
@@ -4622,7 +4589,7 @@ current checked-in Unicode-17 output is unaffected.
 
 Evidence: the standalone entry point uses ~open(sys.argv[1], "rt").read()~
 without an encoding.  Official ~DerivedName.txt~ files contain non-ASCII text
-in their copyright header.  With UTF-8 mode and locale coercion disabled under
+in their copyright header.  With Python UTF-8 mode and locale coercion disabled under
 an ASCII locale, decoding fails before parsing.  The integrated
 ~ucdprops2code.py~ path already reads UCD files as UTF-8.
 
@@ -4640,8 +4607,8 @@ affected.
 
 *** PY242 [MEDIUM] Strip mappings retain decomposable intermediates
 :PROPERTIES:
-:FILE: tools/ucdprops2code.py
-:LINES: 643-669
+:FILE: tools/ucdprops2code.py, src/unicode.c
+:LINES: tools/ucdprops2code.py:643-669; src/unicode.c:1542-1567,1598-1630
 :CATEGORY: Unicode normalization / generated-data correctness
 :CONFIDENCE: high
 :STATUS: open
@@ -4650,9 +4617,7 @@ affected.
 Evidence: ~extract_strip()~ parses one decomposition level, filters immediate
 children in stripped categories, and stores the remaining immediate children
 without recursively expanding them.  The generated table consequently maps
-U+01D5 to U+00DC, U+01FA to U+00C5, and U+01C4 to U+0044 U+017D.  Runtime
-stripping performs one lookup for each original code point and does not
-reprocess replacements.
+U+01D5 to U+00DC, U+01FA to U+00C5, and U+01C4 to U+0044 U+017D.  Runtime stripping looks up each original code point during sizing and again during writing, but writes replacements directly without reprocessing them.
 
 Impact: ~apsw.unicode.strip()~ is non-idempotent and can leave diacritics or
 compatibility forms behind: U+01D5 becomes ~Ü~ rather than ~U~, U+01FA becomes
@@ -4669,7 +4634,7 @@ compatibility forms behind: U+01D5 becomes ~Ü~ rather than ~U~, U+01FA becomes
 *** PY243 [LOW] Output publication can truncate generated C before generation succeeds
 :PROPERTIES:
 :FILE: tools/ucdprops2code.py
-:LINES: 1112-1116, 1129-1150
+:LINES: tools/ucdprops2code.py:1112-1116,1129-1150; Makefile:281-283
 :CATEGORY: generated-output publication / failure handling
 :CONFIDENCE: high
 :STATUS: open
@@ -4697,7 +4662,7 @@ metadata inconsistent.
 *** PY244 [MEDIUM] Unicode inputs are not bound to one immutable release
 :PROPERTIES:
 :FILE: tools/ucdprops2code.py
-:LINES: 403-419, 687-690, 723-728, 775-779, 1043-1046
+:LINES: 403-419,607-669,687-690,723-728,775-779,1043-1046
 :CATEGORY: source integrity / Unicode-version consistency
 :CONFIDENCE: high
 :STATUS: open
@@ -4705,8 +4670,9 @@ metadata inconsistent.
 
 Evidence: UCD files are read independently from mutable ~/latest/~ URLs or a
 local directory.  Most version-bearing files are checked, but
-~DerivedAge.txt~—which has a parseable version header—is not, and
-~UnicodeData.txt~ has no independent snapshot binding.  Mixed local data can
+~DerivedAge.txt~—which has a parseable version header—is passed to ~populate()~
+without ~extract_version()~, and ~UnicodeData.txt~ has no independent snapshot
+binding.  Mixed local data can
 therefore pass validation.  In particular, code points missing from an older
 ~UnicodeData.txt~ default to a zero strip mapping and can be treated as
 stripped despite newer category data.
@@ -4755,15 +4721,16 @@ strip tables from malformed or incomplete UCD input.
 *** PY246 [MEDIUM] Marker-based update can target or truncate the wrong Python source
 :PROPERTIES:
 :FILE: tools/ucdprops2code.py
-:LINES: 1095-1097, 1134-1150
+:LINES: 1066-1069,1095-1097,1134-1150
 :CATEGORY: generated-output publication / path safety
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
 Evidence: the generator rewrites relative ~apsw/unicode.py~ using an
-unvalidated begin/end-marker state machine.  Missing or reversed markers can
-discard content through EOF; duplicate pairs are silently rewritten.  Unlike
+unvalidated begin/end-marker state machine.  Missing closing or reversed
+markers can discard content through EOF, duplicate pairs are silently
+rewritten, and a missing opening marker is silently ignored.  Unlike
 helper-module loading, this target is not resolved from ~__file__~, so an
 out-of-root invocation may fail after C publication or rewrite a matching
 CWD-local file.
@@ -4834,7 +4801,7 @@ reading or rewriting the Python target after C generation has completed.
 *** PY249 [MEDIUM] Bootstrap and prerequisite failures can report successful builds
 :PROPERTIES:
 :FILE: tools/vend.py
-:LINES: 543-574, 658-726, 973-977
+:LINES: 553-574,658-726,973-977; tools/megatest.py:34-35,57-67
 :CATEGORY: build failure reporting / command exit status
 :CONFIDENCE: high
 :STATUS: open
@@ -4871,10 +4838,11 @@ optional extra abort packaging.
 :STATUS: open
 :END:
 
-Evidence: ~libsqlite3_tool~ and ~sqlite3_stdio.c~ are compiled before requested
-types are filtered.  Extensions explicitly do not use either support component,
-yet ~compile --only extension~ still requires them and copies the support
-library into the package binary directory.
+Evidence: ~libsqlite3_tool~ is compiled and copied into the package binary
+directory, and ~sqlite3_stdio.c~ is compiled to objects, before requested types
+are filtered.  Extensions explicitly do not use either support component, yet
+~compile --only extension~ still requires them; only the copied library becomes
+an orphan package artifact.
 
 Impact: an extension-only request can fail before extensions are attempted
 because of unrelated executable support code, performs unnecessary compilation,
@@ -4892,7 +4860,7 @@ and publishes an orphan support artifact not represented in
 *** PY251 [MEDIUM] RST generation can leave a partial target that Make treats as current
 :PROPERTIES:
 :FILE: tools/vend.py
-:LINES: 987-988, 989-1063
+:LINES: 987-988,989-1023,1025-1063; Makefile:117-118
 :CATEGORY: generated documentation / failure-safe publication
 :CONFIDENCE: high
 :STATUS: open
@@ -4904,9 +4872,10 @@ An import or extension-load failure therefore occurs after the target has been
 partially replaced.  The Make recipe directly invokes the generator and lacks
 ~.DELETE_ON_ERROR~ protection.
 
-Impact: after a transient failure, a partial RST file can be newer than its
-declared prerequisite and be accepted by a later Make invocation, allowing
-incomplete generated documentation into subsequent processing.
+Impact: after a transient failure, a partially rewritten RST file can remain
+present and be newer than ~tools/vend.py~, its declared prerequisite, so a later
+Make invocation can accept it as current and allow incomplete generated
+documentation into subsequent processing.
 
 - Direction: generate into a same-directory temporary file, complete all
   imports, loads, and introspection before ~os.replace()~, and clean temporary
@@ -4921,18 +4890,18 @@ incomplete generated documentation into subsequent processing.
 *** PY252 [MEDIUM] Repr variants use independently generated data and confound comparisons
 :PROPERTIES:
 :FILE: tools/vtbench.py
-:LINES: 57-60, 98-104
+:LINES: 57-60,98-104,112
 :CATEGORY: benchmark methodology / comparative validity
 :CONFIDENCE: high
 :STATUS: open
 :END:
 
 Evidence: the normal/hidden dataset and ~repr~ dataset independently call
-~gen_value()~.  The latter is not derived from the former with only row 5's
-~quadrangle~ changed.  Corresponding rows consequently differ in nearly every
-random field, including aggregate blob and source-string payload sizes, while
-~repr_invalid~ is intended to measure value validation and occasional
-~repr()~ conversion.
+~gen_value()~.  The latter is not derived from the former by changing only the
+sixth row's (~i == 5~) ~quadrangle~; corresponding rows instead differ in
+nearly every random field, including aggregate blob and string-payload lengths
+and totals, while ~repr_invalid~ is intended to measure value validation and
+occasional ~repr()~ conversion.
 
 Impact: deltas between normal and ~repr~ variants cannot be attributed cleanly
 to ~repr_invalid~ handling.  Comparisons among the three ~repr~ variants remain
@@ -4940,16 +4909,16 @@ valid because they share ~rows_repr~, as do normal-versus-hidden comparisons
 using ~rows~.
 
 - Direction: generate one baseline dataset and derive ~rows_repr~ from it,
-  changing only row 5's ~quadrangle~ to the intended invalid object.
+  changing only the sixth row's (~i == 5~) ~quadrangle~ to the intended invalid object.
 - Test: require corresponding datasets to have equal lengths and equal fields
-  except for that one value; require equal source/blob totals and verify the
+  except for that one value; require equal string/blob totals and verify the
   invalid value still reaches ~repr()~ during a query.
 
 
 *** PY253 [MEDIUM] Fixed ordering and absent warm-up may bias benchmark variants
 :PROPERTIES:
 :FILE: tools/vtbench.py
-:LINES: 85, 90-92, 119-121, 128-131
+:LINES: 90-92,112-123,126-131
 :CATEGORY: benchmark methodology / runtime-sensitive measurement
 :CONFIDENCE: high
 :STATUS: benchmark
